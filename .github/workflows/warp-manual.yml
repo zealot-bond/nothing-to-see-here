@@ -1,35 +1,21 @@
-name: Mint WARP Accounts (Auto & Manual)
+name: Mint WARP Lanes (fixed)
 
 on:
   schedule:
-    - cron: '*/5 * * * *' # Automatically runs every 5 minutes
-  workflow_dispatch:      # Allows manual trigger anytime from the Actions tab
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
     inputs:
       workers:
-        description: 'Number of parallel runners (each gets a different Azure IP, max 20)'
+        description: 'Parallel runners (distinct Azure IPs)'
         required: true
-        default: '20'
-        type: choice
-        options:
-          - '5'   # 5 IPs  x 5 = 25 accounts
-          - '10'  # 10 IPs x 5 = 50 accounts
-          - '20' 
-          - '60'
-          - '100'
-          - '150'
-          - '200'
-          
-      
-          
-          # 20 IPs x 5 = 100 accounts
+        default: '5'
       accounts_per_worker:
-        description: 'Accounts per worker (keep <= 5 to stay under the 1-min IP limit)'
+        description: 'Accounts per worker (<=5 per IP per minute)'
         required: true
         default: '5'
 
-# Prevent runs from overlapping if there is slight queue jitter
 concurrency:
-  group: warp-auto-minter
+  group: warp-fixed-minter
   cancel-in-progress: false
 
 jobs:
@@ -40,7 +26,7 @@ jobs:
     steps:
       - id: set-matrix
         run: |
-          COUNT="${{ github.event.inputs.workers || '20' }}"
+          COUNT="${{ github.event.inputs.workers || '5' }}"
           MATRIX_JSON=$(node -e "console.log(JSON.stringify(Array.from({ length: Number('$COUNT') }, (_, i) => i + 1)))")
           echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
 
@@ -52,7 +38,7 @@ jobs:
       matrix:
         worker: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
     steps:
-      - name: Mint & Ship to Panel
+      - name: Mint and ship lanes
         env:
           PANEL_URL: ${{ secrets.PANEL_URL }}
           IMPORT_SECRET: ${{ secrets.IMPORT_SECRET }}
@@ -61,155 +47,64 @@ jobs:
         run: |
           node -e '
           const crypto = require("node:crypto");
-          const http = require("node:http");
           const https = require("node:https");
-
-          const postJson = (url, data, headers = {}, timeoutMs = 35000) => new Promise((resolve, reject) => {
+          const postJson = (url, data, headers = {}, timeoutMs = 30000) => new Promise((resolve, reject) => {
             const u = new URL(url);
-            const isHttps = u.protocol === "https:";
-            const client = isHttps ? https : http;
             const body = JSON.stringify(data);
-            
-            const req = client.request({
-              hostname: u.hostname,
-              port: u.port || (isHttps ? 443 : 80),
-              path: u.pathname + u.search,
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "Content-Length": Buffer.byteLength(body),
-                ...headers
-              },
+            const req = https.request({
+              hostname: u.hostname, port: u.port || 443, path: u.pathname + u.search, method: "POST",
+              headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body), ...headers },
               timeout: timeoutMs,
-              ...(isHttps ? { rejectUnauthorized: false } : {})
             }, (res) => {
               let raw = "";
               res.on("data", (c) => raw += c);
-              res.on("end", () => {
-                try { resolve({ status: res.statusCode, data: JSON.parse(raw) }); }
-                catch { resolve({ status: res.statusCode, raw }); }
-              });
+              res.on("end", () => { try { resolve({ status: res.statusCode, data: JSON.parse(raw) }); }
+                catch { resolve({ status: res.statusCode, raw }); } });
             });
             req.on("error", reject);
-            req.on("timeout", () => { req.destroy(); reject(new Error("Request timed out")); });
-            req.write(body);
-            req.end();
+            req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
+            req.write(body); req.end();
           });
-
-          function generateWgKeyPair() {
-            const { privateKey, publicKey } = crypto.generateKeyPairSync("x25519", {
-              publicKeyEncoding: { type: "spki", format: "der" },
-              privateKeyEncoding: { type: "pkcs8", format: "der" }
-            });
-            return {
-              privateKey: privateKey.subarray(privateKey.length - 32).toString("base64"),
-              publicKey: publicKey.subarray(publicKey.length - 32).toString("base64")
-            };
-          }
-
-          async function registerWarp() {
-            const { privateKey, publicKey } = generateWgKeyPair();
-            const res = await postJson("https://api.cloudflareclient.com/v0a3160/reg", {
-              install_id: "",
-              tos: new Date().toISOString(),
-              key: publicKey,
-              fcm_token: "",
-              type: "Android",
-              locale: "en_US"
-            }, {
-              "User-Agent": "okhttp/3.12.1",
-              "CF-Client-Version": "a-6.3-3160"
-            });
-
-            const r = res.data?.result || res.data;
-
-            if (res.status !== 200 || !r || !r.id || !r.config) {
-              throw new Error(`CF reg failed (${res.status}): ${JSON.stringify(res.data || res.raw)}`);
-            }
-
-            const peer = (r.config.peers && r.config.peers[0]) || {};
-            const endpointHost = (peer.endpoint && peer.endpoint.host) || "162.159.192.1:2408";
-            let peerHost = "162.159.192.1";
-            let peerPort = 2408;
-
-            if (endpointHost.includes(":") && !endpointHost.startsWith("[")) {
-              const parts = endpointHost.split(":");
-              peerHost = parts[0] || peerHost;
-              peerPort = Number(parts[1]) || peerPort;
-            } else {
-              peerHost = endpointHost;
-            }
-
-            return {
-              accountId: r.id,
-              privateKey: privateKey,
-              ipv6: r.config.interface.addresses.v6,
-              reserved: r.config.client_id || [0, 0, 0],
-              peerKey: peer.public_key || "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-              peerHost: peerHost,
-              peerPort: peerPort
-            };
-          }
-
-          async function shipWithRetry(targetUrl, lanes, headers, workerId, maxRetries = 3) {
-            for (let attempt = 1; attempt <= maxRetries; attempt++) {
-              try {
-                const res = await postJson(targetUrl, lanes, headers, 35000);
-                return res;
-              } catch (err) {
-                console.warn(`[Worker ${workerId}] Ship attempt ${attempt}/${maxRetries} failed: ${err.message}`);
-                if (attempt === maxRetries) throw err;
-                // Wait 3s before retry
-                await new Promise((r) => setTimeout(r, 3000));
-              }
-            }
-          }
-
-          async function main() {
-            const worker = process.env.WORKER_ID;
-            const panelUrl = (process.env.PANEL_URL || "").trim();
-            const secret = (process.env.IMPORT_SECRET || "").trim();
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          (async () => {
             const target = Number(process.env.COUNT) || 5;
-
-            if (!panelUrl) throw new Error("PANEL_URL secret is missing in GitHub repository settings");
-
-            const lanes = [];
-            console.log(`[Worker ${worker}] Minting ${target} WARP accounts on this runner IP...`);
-
+            const accounts = [];
             for (let i = 0; i < target; i++) {
+              const { privateKey, publicKey } = crypto.generateKeyPairSync("x25519", {
+                publicKeyEncoding: { type: "spki", format: "der" },
+                privateKeyEncoding: { type: "pkcs8", format: "der" },
+              });
+              const privB64 = privateKey.subarray(-32).toString("base64");
+              const pubB64 = publicKey.subarray(-32).toString("base64");
+              const installId = crypto.randomUUID();
+              let res;
               try {
-                const lane = await registerWarp();
-                lanes.push(lane);
-                console.log(`[Worker ${worker}] Minted account ${i + 1}/${target} (id: ${lane.accountId})`);
-              } catch (err) {
-                console.error(`[Worker ${worker}] Failed to mint #${i + 1}: ${err.message}`);
-              }
-              await new Promise((r) => setTimeout(r, 2500));
+                res = await postJson("https://api.cloudflareclient.com/v0a4005/reg", {
+                  install_id: installId,
+                  fcm_token: installId + ":APA91b" + crypto.randomBytes(32).toString("base64url"),
+                  tos: new Date().toISOString().slice(0, 19) + ".000Z",
+                  model: "PC", serial_number: installId, locale: "en_US", key: pubB64,
+                }, { "User-Agent": "okhttp/4.12.0" });
+              } catch (e) { console.error("net error, stopping job:", e.message); break; }
+              if (res.status === 429) { console.log("throttled, stopping job (cron resumes)"); break; }
+              if (res.status !== 200 || !res.data?.id || !res.data?.config) { console.error("reg failed:", res.status); break; }
+              const j = res.data;
+              accounts.push({
+                accountId: j.id, token: j.token, privateKey: privB64,
+                reserved: [...Buffer.from(j.config.client_id, "base64")],
+                ipv6: j.config.interface.addresses.v6,
+                peerKey: j.config.peers[0].public_key,
+                peerHost: "engage.cloudflareclient.com", peerPort: 2408,
+                createdAt: new Date().toISOString(),
+              });
+              process.stdout.write("+");
+              await sleep(70000);
             }
-
-            if (lanes.length === 0) {
-              console.log(`[Worker ${worker}] No lanes minted, skipping import.`);
-              return;
-            }
-
-            // Stagger panel requests with 0-5s jitter to prevent thundering herd
-            const jitterMs = Math.floor(Math.random() * 5000);
-            await new Promise((r) => setTimeout(r, jitterMs));
-
-            const targetUrl = `${panelUrl.replace(/\/+$/, "")}/app/import`;
-            console.log(`[Worker ${worker}] Shipping ${lanes.length} lanes to panel (${targetUrl})...`);
-            
-            const headers = {};
-            if (secret) {
-              headers["x-import-secret"] = secret;
-            }
-
-            const res = await shipWithRetry(targetUrl, lanes, headers, worker, 3);
-            console.log(`[Worker ${worker}] Panel import response (HTTP ${res.status}):`, JSON.stringify(res.data || res.raw));
-          }
-
-          main().catch((err) => {
-            console.error("Worker error:", err);
-            process.exit(1);
-          });
+            console.log(`\nminted ${accounts.length}, importing...`);
+            if (!accounts.length) return;
+            const out = await postJson(process.env.PANEL_URL.replace(/\/+$/, "") + "/app/import",
+              { version: 1, accounts },
+              { "x-import-secret": process.env.IMPORT_SECRET });
+            console.log("panel:", out.status, JSON.stringify(out.data).slice(0, 200));
+          })().catch((e) => { console.error("failed:", e); process.exit(1); });
           '
