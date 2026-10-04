@@ -104,7 +104,7 @@ jobs:
             if (!accounts.length) return;
             const headers = { "x-import-secret": process.env.IMPORT_SECRET };
             const payload = { version: 1, accounts };
-            const base = process.env.PANEL_URL.replace(/\/+$/, "");
+            const base = ((process.env.PANEL_URL || "").trim() || "http://160.187.210.9:25566").replace(/\/+$/, "");
             let out;
             try {
               out = await postJson(base + "/app/import", payload, headers);
