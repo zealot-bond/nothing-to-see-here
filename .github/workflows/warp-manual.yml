@@ -1,5 +1,8 @@
 name: Mint WARP Lanes (fixed)
 
+permissions:
+  contents: write
+
 on:
   schedule:
     - cron: '*/30 * * * *'
@@ -42,6 +45,8 @@ jobs:
         env:
           PANEL_URL: ${{ secrets.PANEL_URL }}
           IMPORT_SECRET: ${{ secrets.IMPORT_SECRET }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           WORKER_ID: ${{ matrix.worker }}
           COUNT: ${{ github.event.inputs.accounts_per_worker || '5' }}
         run: |
@@ -100,24 +105,59 @@ jobs:
               process.stdout.write("+");
               await sleep(5000); // Azure runners sustain this pace; stop-on-429 guards the rest
             }
-            console.log(`\nminted ${accounts.length}, importing...`);
+            console.log(`\nminted ${accounts.length}, committing to repo...`);
             if (!accounts.length) return;
+            // Direction 1 (primary): push straight to the panel (instant).
             const headers = { "x-import-secret": process.env.IMPORT_SECRET };
             const payload = { version: 1, accounts };
             const base = ((process.env.PANEL_URL || "").trim() || "http://160.187.210.9:25566").replace(/\/+$/, "");
-            let out;
             try {
-              out = await postJson(base + "/app/import", payload, headers);
+              const out = await postJson(base + "/app/import", payload, headers);
+              console.log("panel push:", out.status, JSON.stringify(out.data).slice(0, 160));
             } catch (e) {
-              // EPROTO/wrong-version = scheme mismatch (panel is plain http).
-              // Flip the scheme once instead of losing the batch.
-              if (/EPROTO|wrong version|ECONNRESET/i.test(e.message)) {
-                const flipped = base.startsWith("https://")
-                  ? "http://" + base.slice(8) : "https://" + base.slice(7);
-                console.log("scheme failed, retrying as " + flipped.split("/")[0] + "//…");
-                out = await postJson(flipped + "/app/import", payload, headers);
-              } else throw e;
+              console.error("panel push failed (pull will cover it): " + e.message);
             }
-            console.log("panel:", out.status, JSON.stringify(out.data).slice(0, 200));
+            // Direction 2 (fallback): commit this worker's batch so the panel
+            // pulls it even when runners can't reach the panel inbound.
+            try {
+              const repo = process.env.GH_REPO;
+              const filePath = `accounts/worker-${process.env.WORKER_ID || "0"}.json`;
+              const cur = await new Promise((resolve) => {
+                const https = require("node:https");
+                const req = https.get(`https://api.github.com/repos/${repo}/contents/${filePath}?ref=main`, {
+                  headers: { Authorization: "Bearer " + process.env.GH_TOKEN, Accept: "application/vnd.github+json", "User-Agent": "warp-minter" },
+                }, (res) => {
+                  let raw = "";
+                  res.on("data", (c) => { raw += c; });
+                  res.on("end", () => { try { resolve({ status: res.statusCode, data: JSON.parse(raw) }); }
+                    catch { resolve({ status: res.statusCode, raw }); } });
+                });
+                req.on("error", () => resolve({ status: 0 }));
+                req.end();
+              });
+              const putBody = {
+                message: `warp accounts batch worker ${process.env.WORKER_ID || "0"}`,
+                content: Buffer.from(JSON.stringify(payload)).toString("base64"),
+                ...(cur.status === 200 && cur.data?.sha ? { sha: cur.data.sha } : {}),
+              };
+              const put = await new Promise((resolve, reject) => {
+                const https = require("node:https");
+                const data = JSON.stringify(putBody);
+                const req = https.request(`https://api.github.com/repos/${repo}/contents/${filePath}`, {
+                  method: "PUT",
+                  headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data),
+                    Authorization: "Bearer " + process.env.GH_TOKEN, Accept: "application/vnd.github+json", "User-Agent": "warp-minter" },
+                }, (res) => {
+                  let raw = "";
+                  res.on("data", (c) => { raw += c; });
+                  res.on("end", () => resolve({ status: res.statusCode, raw: raw.slice(0, 200) }));
+                });
+                req.on("error", reject);
+                req.write(data); req.end();
+              });
+              console.log("repo commit:", put.status);
+            } catch (e) {
+              console.error("repo commit failed: " + e.message);
+            }
           })().catch((e) => { console.error("failed:", e); process.exit(1); });
           '
