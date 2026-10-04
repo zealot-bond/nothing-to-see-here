@@ -39,21 +39,25 @@ jobs:
     steps:
       - name: Mint & Ship to Panel
         env:
-          PANEL_URL: ${{ secrets.PANEL_URL }}         # e.g. https://your-panel:25474
+          PANEL_URL: ${{ secrets.PANEL_URL }}         # e.g. http://123.45.67.89:25474
           IMPORT_SECRET: ${{ secrets.IMPORT_SECRET }} # Optional auth header
           WORKER_ID: ${{ matrix.worker }}
           COUNT: ${{ github.event.inputs.accounts_per_worker }}
         run: |
           node -e '
           const crypto = require("node:crypto");
+          const http = require("node:http");
           const https = require("node:https");
 
           const postJson = (url, data, headers = {}) => new Promise((resolve, reject) => {
             const u = new URL(url);
+            const isHttps = u.protocol === "https:";
+            const client = isHttps ? https : http;
             const body = JSON.stringify(data);
-            const req = https.request({
+            
+            const req = client.request({
               hostname: u.hostname,
-              port: u.port || 443,
+              port: u.port || (isHttps ? 443 : 80),
               path: u.pathname + u.search,
               method: "POST",
               headers: {
@@ -61,7 +65,8 @@ jobs:
                 "Content-Length": Buffer.byteLength(body),
                 ...headers
               },
-              timeout: 15000
+              timeout: 20000,
+              ...(isHttps ? { rejectUnauthorized: false } : {})
             }, (res) => {
               let raw = "";
               res.on("data", (c) => raw += c);
@@ -101,7 +106,6 @@ jobs:
               "CF-Client-Version": "a-6.3-3160"
             });
 
-            // Handles both unwrapped objects and wrapped .result formats
             const r = res.data?.result || res.data;
 
             if (res.status !== 200 || !r || !r.id || !r.config) {
@@ -138,7 +142,6 @@ jobs:
               } catch (err) {
                 console.error(`[Worker ${worker}] Failed to mint #${i + 1}: ${err.message}`);
               }
-              // 2.5s spacing between registrations on this runner IP
               await new Promise((r) => setTimeout(r, 2500));
             }
 
@@ -147,7 +150,7 @@ jobs:
               return;
             }
 
-            console.log(`[Worker ${worker}] Shipping ${lanes.length} lanes to panel...`);
+            console.log(`[Worker ${worker}] Shipping ${lanes.length} lanes to panel (${panelUrl})...`);
             const headers = secret ? { "x-import-secret": secret } : {};
             const res = await postJson(`${panelUrl.replace(/\/+$/, "")}/app/import`, lanes, headers);
             console.log(`[Worker ${worker}] Panel import response (${res.status}):`, res.data || res.raw);
