@@ -98,7 +98,7 @@ jobs:
                 createdAt: new Date().toISOString(),
               });
               process.stdout.write("+");
-              await sleep(70000);
+              await sleep(5000); // Azure runners sustain this pace; stop-on-429 guards the rest
             }
             console.log(`\nminted ${accounts.length}, importing...`);
             if (!accounts.length) return;
