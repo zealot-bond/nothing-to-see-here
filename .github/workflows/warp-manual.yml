@@ -1,0 +1,159 @@
+name: Mint WARP Accounts (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      workers:
+        description: 'Number of parallel runners (each gets a different Azure IP, max 20)'
+        required: true
+        default: '20'
+        type: choice
+        options:
+          - '5'   # 5 IPs  x 5 = 25 accounts
+          - '10'  # 10 IPs x 5 = 50 accounts
+          - '20'  # 20 IPs x 5 = 100 accounts
+      accounts_per_worker:
+        description: 'Accounts per worker (keep <= 5 to stay under the 1-min IP limit)'
+        required: true
+        default: '5'
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: |
+          COUNT="${{ github.event.inputs.workers }}"
+          # Generate an array [1, 2, ..., COUNT] dynamically
+          MATRIX_JSON=$(node -e "console.log(JSON.stringify(Array.from({ length: Number('$COUNT') }, (_, i) => i + 1)))")
+          echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
+
+  mint:
+    needs: prepare-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+    steps:
+      - name: Mint & Ship to Panel
+        env:
+          PANEL_URL: ${{ secrets.PANEL_URL }}         # e.g. https://your-panel:25474
+          IMPORT_SECRET: ${{ secrets.IMPORT_SECRET }} # Optional auth header
+          WORKER_ID: ${{ matrix.worker }}
+          COUNT: ${{ github.event.inputs.accounts_per_worker }}
+        run: |
+          node -e '
+          const crypto = require("node:crypto");
+          const https = require("node:https");
+
+          const postJson = (url, data, headers = {}) => new Promise((resolve, reject) => {
+            const u = new URL(url);
+            const body = JSON.stringify(data);
+            const req = https.request({
+              hostname: u.hostname,
+              port: u.port || 443,
+              path: u.pathname + u.search,
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Content-Length": Buffer.byteLength(body),
+                ...headers
+              },
+              timeout: 15000
+            }, (res) => {
+              let raw = "";
+              res.on("data", (c) => raw += c);
+              res.on("end", () => {
+                try { resolve({ status: res.statusCode, data: JSON.parse(raw) }); }
+                catch { resolve({ status: res.statusCode, raw }); }
+              });
+            });
+            req.on("error", reject);
+            req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
+            req.write(body);
+            req.end();
+          });
+
+          function generateWgKeyPair() {
+            const { privateKey, publicKey } = crypto.generateKeyPairSync("x25519", {
+              publicKeyEncoding: { type: "spki", format: "der" },
+              privateKeyEncoding: { type: "pkcs8", format: "der" }
+            });
+            return {
+              privateKey: privateKey.subarray(privateKey.length - 32).toString("base64"),
+              publicKey: publicKey.subarray(publicKey.length - 32).toString("base64")
+            };
+          }
+
+          async function registerWarp() {
+            const { privateKey, publicKey } = generateWgKeyPair();
+            const res = await postJson("https://api.cloudflareclient.com/v0a3160/reg", {
+              install_id: "",
+              tos: new Date().toISOString(),
+              key: publicKey,
+              fcm_token: "",
+              type: "Android",
+              locale: "en_US"
+            }, {
+              "User-Agent": "okhttp/3.12.1",
+              "CF-Client-Version": "a-6.3-3160"
+            });
+
+            if (res.status !== 200 || !res.data?.result) {
+              throw new Error(`CF reg failed (${res.status}): ${JSON.stringify(res.data || res.raw)}`);
+            }
+
+            const r = res.data.result;
+            return {
+              id: r.id,
+              token: r.token,
+              privateKey,
+              publicKey,
+              v4: r.config.interface.addresses.v4,
+              v6: r.config.interface.addresses.v6,
+              endpoint: r.config.peers[0].endpoint.host
+            };
+          }
+
+          async function main() {
+            const worker = process.env.WORKER_ID;
+            const panelUrl = process.env.PANEL_URL;
+            const secret = process.env.IMPORT_SECRET;
+            const target = Number(process.env.COUNT) || 5;
+
+            if (!panelUrl) throw new Error("PANEL_URL secret is missing");
+
+            const lanes = [];
+            console.log(`[Worker ${worker}] Minting ${target} accounts on this runner IP...`);
+
+            for (let i = 0; i < target; i++) {
+              try {
+                const lane = await registerWarp();
+                lanes.push(lane);
+                console.log(`[Worker ${worker}] Minted account ${i + 1}/${target} (id: ${lane.id})`);
+              } catch (err) {
+                console.error(`[Worker ${worker}] Failed to mint #${i + 1}: ${err.message}`);
+              }
+              // 2.5s jitter between registrations on this runner IP
+              await new Promise((r) => setTimeout(r, 2500));
+            }
+
+            if (lanes.length === 0) {
+              console.log(`[Worker ${worker}] No lanes minted, skipping import.`);
+              return;
+            }
+
+            console.log(`[Worker ${worker}] Shipping ${lanes.length} lanes to panel...`);
+            const headers = secret ? { "x-import-secret": secret } : {};
+            const res = await postJson(`${panelUrl.replace(/\/+$/, "")}/app/import`, lanes, headers);
+            console.log(`[Worker ${worker}] Panel import response (${res.status}):`, res.data || res.raw);
+          }
+
+          main().catch((err) => {
+            console.error("Worker error:", err);
+            process.exit(1);
+          });
+          '
