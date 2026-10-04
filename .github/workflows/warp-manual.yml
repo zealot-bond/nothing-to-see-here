@@ -48,6 +48,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           WORKER_ID: ${{ matrix.worker }}
+          RUN_ID: ${{ github.run_id }}
           COUNT: ${{ github.event.inputs.accounts_per_worker || '5' }}
         run: |
           node -e '
@@ -121,24 +122,13 @@ jobs:
             // pulls it even when runners cannot reach the panel inbound.
             try {
               const repo = process.env.GH_REPO;
-              const filePath = `accounts/worker-${process.env.WORKER_ID || "0"}.json`;
-              const cur = await new Promise((resolve) => {
-                const https = require("node:https");
-                const req = https.get(`https://api.github.com/repos/${repo}/contents/${filePath}?ref=main`, {
-                  headers: { Authorization: "Bearer " + process.env.GH_TOKEN, Accept: "application/vnd.github+json", "User-Agent": "warp-minter" },
-                }, (res) => {
-                  let raw = "";
-                  res.on("data", (c) => { raw += c; });
-                  res.on("end", () => { try { resolve({ status: res.statusCode, data: JSON.parse(raw) }); }
-                    catch { resolve({ status: res.statusCode, raw }); } });
-                });
-                req.on("error", () => resolve({ status: 0 }));
-                req.end();
-              });
+              // Unique per run+worker: concurrent runs (cron + manual) can
+              // never collide on the same file. Panel dedupes by accountId,
+              // so re-pulled or overlapping batches are harmless.
+              const filePath = `accounts/r${process.env.RUN_ID || "local"}-w${process.env.WORKER_ID || "0"}.json`;
               const putBody = {
-                message: `warp accounts batch worker ${process.env.WORKER_ID || "0"}`,
+                message: `warp accounts batch run ${process.env.RUN_ID || "local"} worker ${process.env.WORKER_ID || "0"}`,
                 content: Buffer.from(JSON.stringify(payload)).toString("base64"),
-                ...(cur.status === 200 && cur.data?.sha ? { sha: cur.data.sha } : {}),
               };
               const put = await new Promise((resolve, reject) => {
                 const https = require("node:https");
