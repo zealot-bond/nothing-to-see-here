@@ -17,7 +17,7 @@ on:
       accounts_per_worker:
         description: 'Accounts per worker (keep <= 5 to stay under the 1-min IP limit)'
         required: true
-        default: '6'
+        default: '5'
 
 # Prevent runs from overlapping if there is slight queue jitter
 concurrency:
@@ -32,7 +32,6 @@ jobs:
     steps:
       - id: set-matrix
         run: |
-          # Use manual input if dispatched, otherwise default to 20 workers on cron
           COUNT="${{ github.event.inputs.workers || '20' }}"
           MATRIX_JSON=$(node -e "console.log(JSON.stringify(Array.from({ length: Number('$COUNT') }, (_, i) => i + 1)))")
           echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
@@ -73,7 +72,7 @@ jobs:
                 "Content-Length": Buffer.byteLength(body),
                 ...headers
               },
-              timeout: 20000,
+              timeout: 25000,
               ...(isHttps ? { rejectUnauthorized: false } : {})
             }, (res) => {
               let raw = "";
@@ -84,7 +83,7 @@ jobs:
               });
             });
             req.on("error", reject);
-            req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
+            req.on("timeout", () => { req.destroy(); reject(new Error("Request timed out")); });
             req.write(body);
             req.end();
           });
@@ -120,33 +119,46 @@ jobs:
               throw new Error(`CF reg failed (${res.status}): ${JSON.stringify(res.data || res.raw)}`);
             }
 
+            const peer = (r.config.peers && r.config.peers[0]) || {};
+            const endpointHost = (peer.endpoint && peer.endpoint.host) || "162.159.192.1:2408";
+            let peerHost = "162.159.192.1";
+            let peerPort = 2408;
+
+            if (endpointHost.includes(":") && !endpointHost.startsWith("[")) {
+              const parts = endpointHost.split(":");
+              peerHost = parts[0] || peerHost;
+              peerPort = Number(parts[1]) || peerPort;
+            } else {
+              peerHost = endpointHost;
+            }
+
             return {
-              id: r.id,
-              token: r.token,
-              privateKey,
-              publicKey,
-              v4: r.config.interface.addresses.v4,
-              v6: r.config.interface.addresses.v6,
-              endpoint: r.config.peers[0].endpoint.host
+              accountId: r.id,
+              privateKey: privateKey,
+              ipv6: r.config.interface.addresses.v6,
+              reserved: r.config.client_id || [0, 0, 0],
+              peerKey: peer.public_key || "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+              peerHost: peerHost,
+              peerPort: peerPort
             };
           }
 
           async function main() {
             const worker = process.env.WORKER_ID;
-            const panelUrl = process.env.PANEL_URL;
-            const secret = process.env.IMPORT_SECRET;
+            const panelUrl = (process.env.PANEL_URL || "").trim();
+            const secret = (process.env.IMPORT_SECRET || "").trim();
             const target = Number(process.env.COUNT) || 5;
 
-            if (!panelUrl) throw new Error("PANEL_URL secret is missing");
+            if (!panelUrl) throw new Error("PANEL_URL secret is missing in GitHub repository settings");
 
             const lanes = [];
-            console.log(`[Worker ${worker}] Minting ${target} accounts on this runner IP...`);
+            console.log(`[Worker ${worker}] Minting ${target} WARP accounts on this runner IP...`);
 
             for (let i = 0; i < target; i++) {
               try {
                 const lane = await registerWarp();
                 lanes.push(lane);
-                console.log(`[Worker ${worker}] Minted account ${i + 1}/${target} (id: ${lane.id})`);
+                console.log(`[Worker ${worker}] Minted account ${i + 1}/${target} (id: ${lane.accountId})`);
               } catch (err) {
                 console.error(`[Worker ${worker}] Failed to mint #${i + 1}: ${err.message}`);
               }
@@ -158,10 +170,16 @@ jobs:
               return;
             }
 
-            console.log(`[Worker ${worker}] Shipping ${lanes.length} lanes to panel (${panelUrl})...`);
-            const headers = secret ? { "x-import-secret": secret } : {};
-            const res = await postJson(`${panelUrl.replace(/\/+$/, "")}/app/import`, lanes, headers);
-            console.log(`[Worker ${worker}] Panel import response (${res.status}):`, res.data || res.raw);
+            const targetUrl = `${panelUrl.replace(/\/+$/, "")}/app/import`;
+            console.log(`[Worker ${worker}] Shipping ${lanes.length} lanes to panel (${targetUrl})...`);
+            
+            const headers = {};
+            if (secret) {
+              headers["x-import-secret"] = secret;
+            }
+
+            const res = await postJson(targetUrl, lanes, headers);
+            console.log(`[Worker ${worker}] Panel import response (HTTP ${res.status}):`, JSON.stringify(res.data || res.raw));
           }
 
           main().catch((err) => {
