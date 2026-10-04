@@ -11,7 +11,7 @@ on:
       workers:
         description: 'Parallel runners (distinct Azure IPs)'
         required: true
-        default: '5000'
+        default: '256'
       accounts_per_worker:
         description: 'Accounts per worker (<=5 per IP per minute)'
         required: true
