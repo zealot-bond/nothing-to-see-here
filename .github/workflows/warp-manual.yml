@@ -117,8 +117,8 @@ jobs:
             } catch (e) {
               console.error("panel push failed (pull will cover it): " + e.message);
             }
-            // Direction 2 (fallback): commit this worker's batch so the panel
-            // pulls it even when runners can't reach the panel inbound.
+            // Direction 2 (fallback): commit this workers batch so the panel
+            // pulls it even when runners cannot reach the panel inbound.
             try {
               const repo = process.env.GH_REPO;
               const filePath = `accounts/worker-${process.env.WORKER_ID || "0"}.json`;
