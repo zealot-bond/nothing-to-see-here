@@ -26,7 +26,6 @@ jobs:
       - id: set-matrix
         run: |
           COUNT="${{ github.event.inputs.workers }}"
-          # Generate an array [1, 2, ..., COUNT] dynamically
           MATRIX_JSON=$(node -e "console.log(JSON.stringify(Array.from({ length: Number('$COUNT') }, (_, i) => i + 1)))")
           echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
 
@@ -102,11 +101,13 @@ jobs:
               "CF-Client-Version": "a-6.3-3160"
             });
 
-            if (res.status !== 200 || !res.data?.result) {
+            // Handles both unwrapped objects and wrapped .result formats
+            const r = res.data?.result || res.data;
+
+            if (res.status !== 200 || !r || !r.id || !r.config) {
               throw new Error(`CF reg failed (${res.status}): ${JSON.stringify(res.data || res.raw)}`);
             }
 
-            const r = res.data.result;
             return {
               id: r.id,
               token: r.token,
@@ -137,7 +138,7 @@ jobs:
               } catch (err) {
                 console.error(`[Worker ${worker}] Failed to mint #${i + 1}: ${err.message}`);
               }
-              // 2.5s jitter between registrations on this runner IP
+              // 2.5s spacing between registrations on this runner IP
               await new Promise((r) => setTimeout(r, 2500));
             }
 
