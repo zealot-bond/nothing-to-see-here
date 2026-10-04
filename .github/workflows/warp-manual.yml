@@ -56,7 +56,7 @@ jobs:
           const http = require("node:http");
           const https = require("node:https");
 
-          const postJson = (url, data, headers = {}) => new Promise((resolve, reject) => {
+          const postJson = (url, data, headers = {}, timeoutMs = 35000) => new Promise((resolve, reject) => {
             const u = new URL(url);
             const isHttps = u.protocol === "https:";
             const client = isHttps ? https : http;
@@ -72,7 +72,7 @@ jobs:
                 "Content-Length": Buffer.byteLength(body),
                 ...headers
               },
-              timeout: 25000,
+              timeout: timeoutMs,
               ...(isHttps ? { rejectUnauthorized: false } : {})
             }, (res) => {
               let raw = "";
@@ -143,6 +143,20 @@ jobs:
             };
           }
 
+          async function shipWithRetry(targetUrl, lanes, headers, workerId, maxRetries = 3) {
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+              try {
+                const res = await postJson(targetUrl, lanes, headers, 35000);
+                return res;
+              } catch (err) {
+                console.warn(`[Worker ${workerId}] Ship attempt ${attempt}/${maxRetries} failed: ${err.message}`);
+                if (attempt === maxRetries) throw err;
+                // Wait 3s before retry
+                await new Promise((r) => setTimeout(r, 3000));
+              }
+            }
+          }
+
           async function main() {
             const worker = process.env.WORKER_ID;
             const panelUrl = (process.env.PANEL_URL || "").trim();
@@ -170,6 +184,10 @@ jobs:
               return;
             }
 
+            // Stagger panel requests with 0-5s jitter to prevent thundering herd
+            const jitterMs = Math.floor(Math.random() * 5000);
+            await new Promise((r) => setTimeout(r, jitterMs));
+
             const targetUrl = `${panelUrl.replace(/\/+$/, "")}/app/import`;
             console.log(`[Worker ${worker}] Shipping ${lanes.length} lanes to panel (${targetUrl})...`);
             
@@ -178,7 +196,7 @@ jobs:
               headers["x-import-secret"] = secret;
             }
 
-            const res = await postJson(targetUrl, lanes, headers);
+            const res = await shipWithRetry(targetUrl, lanes, headers, worker, 3);
             console.log(`[Worker ${worker}] Panel import response (HTTP ${res.status}):`, JSON.stringify(res.data || res.raw));
           }
 
