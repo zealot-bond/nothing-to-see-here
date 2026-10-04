@@ -13,7 +13,15 @@ on:
         options:
           - '5'   # 5 IPs  x 5 = 25 accounts
           - '10'  # 10 IPs x 5 = 50 accounts
-          - '20'  # 20 IPs x 5 = 100 accounts
+          - '20' 
+          - '60'
+          - '100'
+          - '150'
+          - '200'
+          
+      
+          
+          # 20 IPs x 5 = 100 accounts
       accounts_per_worker:
         description: 'Accounts per worker (keep <= 5 to stay under the 1-min IP limit)'
         required: true
