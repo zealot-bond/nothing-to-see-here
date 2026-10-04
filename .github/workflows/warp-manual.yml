@@ -102,9 +102,22 @@ jobs:
             }
             console.log(`\nminted ${accounts.length}, importing...`);
             if (!accounts.length) return;
-            const out = await postJson(process.env.PANEL_URL.replace(/\/+$/, "") + "/app/import",
-              { version: 1, accounts },
-              { "x-import-secret": process.env.IMPORT_SECRET });
+            const headers = { "x-import-secret": process.env.IMPORT_SECRET };
+            const payload = { version: 1, accounts };
+            const base = process.env.PANEL_URL.replace(/\/+$/, "");
+            let out;
+            try {
+              out = await postJson(base + "/app/import", payload, headers);
+            } catch (e) {
+              // EPROTO/wrong-version = scheme mismatch (panel is plain http).
+              // Flip the scheme once instead of losing the batch.
+              if (/EPROTO|wrong version|ECONNRESET/i.test(e.message)) {
+                const flipped = base.startsWith("https://")
+                  ? "http://" + base.slice(8) : "https://" + base.slice(7);
+                console.log("scheme failed, retrying as " + flipped.split("/")[0] + "//…");
+                out = await postJson(flipped + "/app/import", payload, headers);
+              } else throw e;
+            }
             console.log("panel:", out.status, JSON.stringify(out.data).slice(0, 200));
           })().catch((e) => { console.error("failed:", e); process.exit(1); });
           '
