@@ -1,7 +1,9 @@
-name: Mint WARP Accounts (Manual)
+name: Mint WARP Accounts (Auto & Manual)
 
 on:
-  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *' # Automatically runs every 5 minutes
+  workflow_dispatch:      # Allows manual trigger anytime from the Actions tab
     inputs:
       workers:
         description: 'Number of parallel runners (each gets a different Azure IP, max 20)'
@@ -17,6 +19,11 @@ on:
         required: true
         default: '5'
 
+# Prevent runs from overlapping if there is slight queue jitter
+concurrency:
+  group: warp-auto-minter
+  cancel-in-progress: false
+
 jobs:
   prepare-matrix:
     runs-on: ubuntu-latest
@@ -25,7 +32,8 @@ jobs:
     steps:
       - id: set-matrix
         run: |
-          COUNT="${{ github.event.inputs.workers }}"
+          # Use manual input if dispatched, otherwise default to 20 workers on cron
+          COUNT="${{ github.event.inputs.workers || '20' }}"
           MATRIX_JSON=$(node -e "console.log(JSON.stringify(Array.from({ length: Number('$COUNT') }, (_, i) => i + 1)))")
           echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
 
@@ -39,10 +47,10 @@ jobs:
     steps:
       - name: Mint & Ship to Panel
         env:
-          PANEL_URL: ${{ secrets.PANEL_URL }}         # e.g. http://123.45.67.89:25474
-          IMPORT_SECRET: ${{ secrets.IMPORT_SECRET }} # Optional auth header
+          PANEL_URL: ${{ secrets.PANEL_URL }}
+          IMPORT_SECRET: ${{ secrets.IMPORT_SECRET }}
           WORKER_ID: ${{ matrix.worker }}
-          COUNT: ${{ github.event.inputs.accounts_per_worker }}
+          COUNT: ${{ github.event.inputs.accounts_per_worker || '5' }}
         run: |
           node -e '
           const crypto = require("node:crypto");
