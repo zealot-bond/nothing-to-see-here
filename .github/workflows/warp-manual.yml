@@ -17,7 +17,7 @@ on:
       accounts_per_worker:
         description: 'Accounts per worker (keep <= 5 to stay under the 1-min IP limit)'
         required: true
-        default: '5'
+        default: '6'
 
 # Prevent runs from overlapping if there is slight queue jitter
 concurrency:
