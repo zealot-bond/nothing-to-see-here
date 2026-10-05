@@ -1,283 +1,190 @@
-name: warp-manual
-
-# Does a fresh Cloudflare WARP registration hand out a fresh IPv4 egress?
-#
-# Registration uses the raw /v0a4005/reg API because that is the only path that
-# exposes WireGuard credentials on current warp-cli builds (2026.7 is MASQUE-only
-# and has no `tunnel wireguard` subcommand, so keys cannot be exported at all).
-#
-# Each job registers on its own fresh GitHub-hosted VM, stands the tunnel up with
-# sing-box, and asks an external service what address it exits from. A summary
-# job then reports how many DISTINCT v4 addresses the whole run produced --
-# that number decides whether the fleet can be multiplied.
+name: WARP IP Mint & Uniqueness Test
 
 on:
   workflow_dispatch:
     inputs:
-      workers:
-        description: 'Parallel jobs (each on its own fresh VM)'
+      jobs:
+        description: "Number of parallel jobs"
         required: true
-        default: '6'
-      accounts_per_worker:
-        description: 'Registrations per job'
+        default: "20"
+        type: choice
+        options: ["5", "10", "15", "20"]
+      per_job:
+        description: "Registrations per job"
         required: true
-        default: '2'
-      pace_seconds:
-        description: 'Seconds between registrations (window is ~1 min)'
-        required: true
-        default: '70'
-
-permissions:
-  contents: write
-
-concurrency:
-  group: warp-manual
-  cancel-in-progress: false
-
-env:
-  ACCOUNTS_DIR: accounts
+        default: "5"
+        type: choice
+        options: ["3", "5", "8"]
 
 jobs:
-  plan:
-    name: plan-matrix
-    runs-on: ubuntu-latest
-    outputs:
-      worker: ${{ steps.make.outputs.worker }}
-    steps:
-      - id: make
-        env:
-          WORKERS: ${{ inputs.workers }}
-        run: |
-          set -euo pipefail
-          n=$(printf '%s' "$WORKERS" | tr -cd '0-9')
-          [ -z "$n" ] && n=6
-          [ "$n" -gt 20 ] && n=20
-          list=""
-          i=0
-          while [ "$i" -lt "$n" ]; do
-            list="$list${list:+,}$i"
-            i=$((i + 1))
-          done
-          echo "worker=[$list]" >> "$GITHUB_OUTPUT"
-
   mint:
-    needs: plan
-    name: mint-${{ matrix.worker }}
+    name: Job ${{ matrix.job }}
     runs-on: ubuntu-latest
-    timeout-minutes: 40
     strategy:
       fail-fast: false
+      max-parallel: 20
       matrix:
-        worker: ${{ fromJSON(needs.plan.outputs.worker) }}
+        job: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
+
     steps:
-      - name: Install sing-box
+      - name: Install Cloudflare WARP
         run: |
-          set -euo pipefail
-          curl -fsSL -o /tmp/sb.tgz \
-            https://github.com/SagerNet/sing-box/releases/download/v1.11.4/sing-box-1.11.4-linux-amd64.tar.gz
-          tar -xzf /tmp/sb.tgz -C /tmp
-          sudo install -m 0755 /tmp/sing-box-1.11.4-linux-amd64/sing-box /usr/local/bin/sing-box
-          sing-box version | head -1
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update -qq
+          sudo apt-get install -y cloudflare-warp
+          sudo systemctl enable --now warp-svc || true
+          sleep 4
+          warp-cli --version
 
-      - name: Register and measure egress
-        env:
-          WORKER: ${{ matrix.worker }}
-          PER_WORKER: ${{ fromJSON(inputs.accounts_per_worker) }}
-          PACE_SECONDS: ${{ fromJSON(inputs.pace_seconds) }}
+      - name: Mint registrations
         run: |
-          set -uo pipefail
-          mkdir -p data
+          set +e
+          PER_JOB=${{ inputs.per_job }}
+          RESULTS="results-job-${{ matrix.job }}.json"
+          echo "[]" > "$RESULTS"
 
-          cat > measure.cjs <<'NODEEOF'
-          const https = require("node:https");
-          const crypto = require("node:crypto");
-          const fs = require("node:fs");
-          const { spawn, execFileSync } = require("node:child_process");
+          for i in $(seq 1 $PER_JOB); do
+            echo "========================================"
+            echo "Job ${{ matrix.job }} · Registration $i/$PER_JOB"
+            echo "========================================"
 
-          const PER_WORKER = Math.max(1, Number(process.env.PER_WORKER || 2));
-          const PACE_MS = Math.max(60000, Number(process.env.PACE_SECONDS || 70) * 1000);
-          const WORKER = process.env.WORKER || "0";
-          const PORT = 45000 + Number(WORKER) * 10;
-          const rows = [];
-          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-          const log = (...a) => console.log(...a);
+            # Clean previous
+            sudo warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+            sudo warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
+            sleep 1
 
-          const postJson = (bodyObj) => new Promise((resolve) => {
-            const data = JSON.stringify(bodyObj);
-            const req = https.request({
-              hostname: "api.cloudflareclient.com", path: "/v0a4005/reg", method: "POST",
-              headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data), "User-Agent": "okhttp/4.12.0" },
-              timeout: 25000,
-            }, (res) => {
-              let b = ""; res.on("data", (c) => b += c);
-              res.on("end", () => { try { resolve({ status: res.statusCode, data: JSON.parse(b) }); } catch { resolve({ status: res.statusCode }); } });
-            });
-            req.on("error", (e) => resolve({ status: 0, err: e.code }));
-            req.end();
-          });
+            # New registration
+            REG_OUT=$(sudo warp-cli --accept-tos registration new 2>&1)
+            echo "registration new → $REG_OUT"
 
-          const mint = async () => {
-            const { publicKey, privateKey } = crypto.generateKeyPairSync("x25519", {
-              publicKeyEncoding: { type: "spki", format: "der" },
-              privateKeyEncoding: { type: "pkcs8", format: "der" },
-            });
-            const installId = crypto.randomUUID();
-            const res = await postJson({
-              install_id: installId,
-              fcm_token: installId + ":APA91b" + crypto.randomBytes(32).toString("base64url"),
-              tos: new Date().toISOString().slice(0, 19) + ".000Z",
-              model: "PC", serial_number: installId, locale: "en_US",
-              key: publicKey.subarray(-32).toString("base64"),
-            });
-            if (res.status !== 200 || !res.data || !res.data.config) {
-              return { fail: true, status: res.status, err: res.err };
-            }
-            const j = res.data;
-            return {
-              accountId: j.id, token: j.token,
-              privateKey: privateKey.subarray(-32).toString("base64"),
-              reserved: [...Buffer.from(j.config.client_id, "base64")],
-              ipv6: j.config.interface.addresses.v6,
-              peerKey: j.config.peers[0].public_key,
-              peerHost: "engage.cloudflareclient.com",
-              peerPort: 2408,
-              createdAt: new Date().toISOString(),
-            };
-          };
+            # Connect
+            sudo warp-cli --accept-tos connect
+            sleep 5
 
-          const cfgFor = (a, port) => ({
-            log: { level: "error" },
-            dns: { servers: [{ tag: "cf", address: "https://1.1.1.1/dns-query" }], strategy: "ipv4_only" },
-            inbounds: [{ type: "mixed", tag: "in", listen: "127.0.0.1", listen_port: port }],
-            endpoints: [{ type: "wireguard", tag: "wg", address: ["172.16.0.2/32", a.ipv6 + "/128"],
-              private_key: a.privateKey,
-              peers: [{ address: a.peerHost, port: a.peerPort, public_key: a.peerKey,
-                allowed_ips: ["0.0.0.0/0", "::/0"], reserved: a.reserved }] }],
-            outbounds: [{ type: "direct", tag: "direct" }],
-            route: { rules: [{ inbound: "in", outbound: "wg" }] },
-          });
+            # Check if actually connected
+            STATUS=$(sudo warp-cli --accept-tos status 2>&1)
+            echo "status → $STATUS"
 
-          // Force an IPv4 destination so the tunnel uses its v4 egress path.
-          const v4Of = (port) => new Promise((res) => {
-            try {
-              res(execFileSync("curl", ["-s", "--max-time", "20", "--socks5-hostname",
-                "127.0.0.1:" + port, "https://api.ipify.org"],
-                { encoding: "utf8", timeout: 30000 }).trim());
-            } catch { res(null); }
-          });
+            # Get public IPs
+            IPV4=$(curl -4 -s --max-time 10 https://api.ipify.org || curl -4 -s --max-time 8 https://ipv4.icanhazip.com || echo "FAILED")
+            IPV6=$(curl -6 -s --max-time 8 https://api64.ipify.org || echo "none")
 
-          const runTunnel = async (a, port, tag) => {
-            const f = "/tmp/wg-" + tag + ".json";
-            fs.writeFileSync(f, JSON.stringify(cfgFor(a, port)));
-            const p = spawn("sing-box", ["run", "-c", f], { stdio: ["ignore", "ignore", "pipe"] });
-            let err = ""; p.stderr.on("data", (d) => { err += d; });
-            await sleep(8000);
-            const v4 = await v4Of(port);
-            p.kill("SIGKILL");
-            await sleep(1500);
-            return { v4, err: err.replace(/\x1b\[[0-9;]*m/g, "").slice(0, 100) };
-          };
+            echo "IPv4 → $IPV4"
+            echo "IPv6 → $IPV6"
 
-          (async () => {
-            let refused = 0;
-            for (let i = 0; i < PER_WORKER; i++) {
-              const acct = await mint();
-              if (!acct || acct.fail) {
-                refused++;
-                log("[w" + WORKER + "] #" + i + " register REFUSED status=" + (acct && acct.status) +
-                    " err=" + (acct && acct.err) + " (refused " + refused + ")");
-                if (refused >= 4) { log("[w" + WORKER + "] giving up after 4 refusals"); break; }
-                await sleep(PACE_MS);
-                continue;
-              }
-              refused = 0;
-              const { v4, err } = await runTunnel(acct, PORT, WORKER + "-" + i);
-              rows.push({ worker: WORKER, index: i, acctV6: acct.ipv6, egressV4: v4 });
-              log("[w" + WORKER + "] #" + i + " acct-v6=" + acct.ipv6);
-              log("[w" + WORKER + "] #" + i + " egressV4=" + (v4 || "FAIL") + (err ? "  " + err : ""));
-              fs.writeFileSync("data/rows.json", JSON.stringify(rows, null, 1));
-              if (i < PER_WORKER - 1) await sleep(PACE_MS);
-            }
+            # Append result
+            jq -n \
+              --argjson job ${{ matrix.job }} \
+              --argjson idx $i \
+              --arg ipv4 "$IPV4" \
+              --arg ipv6 "$IPV6" \
+              --arg status "$(echo "$STATUS" | tr '\n' ' ' | head -c 200)" \
+              '{job: $job, index: $idx, ipv4: $ipv4, ipv6: $ipv6, status: $status, ts: now|todate}' \
+              > /tmp/one.json
 
-            fs.writeFileSync("data/rows.json", JSON.stringify(rows, null, 1));
-            const v4s = rows.map((r) => r.egressV4).filter(Boolean);
-            const uniq = new Set(v4s);
-            log("[w" + WORKER + "] measured " + v4s.length + " -> " + uniq.size + " distinct v4");
-            for (const v of uniq) log("[w" + WORKER + "]   " + v);
-          })();
-          NODEEOF
+            jq -s '.[0] + [.[1]]' "$RESULTS" /tmp/one.json > /tmp/merged.json
+            mv /tmp/merged.json "$RESULTS"
 
-          node measure.cjs || echo "measure exited nonzero"
-          echo "--- rows ---"
-          cat data/rows.json 2>/dev/null || echo none
+            sleep 2
+          done
 
-      - name: Publish results
-        env:
-          WORKER: ${{ matrix.worker }}
-          ACCOUNTS_DIR: accounts
-        run: |
-          set -uo pipefail
-          mkdir -p results
-          cp data/rows.json "results/w$WORKER.json" 2>/dev/null || echo '[]' > "results/w$WORKER.json"
-          cat "results/w$WORKER.json"
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add results
-          if git diff --cached --quiet; then
-            echo "nothing to publish"
-          else
-            git commit -m "egress v4 measurements from worker $WORKER"
-            for attempt in 1 2 3 4 5; do
-              if git push; then echo pushed; break; fi
-              git pull --rebase --autostash origin "${GITHUB_REF_NAME:-main}" || true
-              sleep 5
-            done
-          fi
+          echo "----- Final results for job ${{ matrix.job }} -----"
+          cat "$RESULTS"
 
-  summary:
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-job-${{ matrix.job }}
+          path: results-job-${{ matrix.job }}.json
+          retention-days: 3
+          if-no-files-found: warn
+
+  analyze:
+    name: Analyze All Results
     needs: mint
     runs-on: ubuntu-latest
     if: always()
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Tally distinct egress addresses
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-results
+          pattern: results-job-*
+          merge-multiple: true
+
+      - name: Generate report
         run: |
-          set -uo pipefail
-          mkdir -p results
-          python3 - << 'PYEOF'
-          import json, glob, collections
-          rows = []
-          for f in sorted(glob.glob("results/w*.json")):
-              try:
-                  rows.extend(json.load(open(f)))
-              except Exception as e:
-                  print("skip", f, e)
-          v4s = [r.get("egressV4") for r in rows if r.get("egressV4")]
-          v6s = [r.get("acctV6") for r in rows if r.get("acctV6")]
-          p48 = collections.Counter(":".join(v.split(":")[:3]) for v in v6s)
-          print("=== registrations measured:", len(rows))
-          print("=== distinct v4 egress   :", len(set(v4s)))
-          print("=== distinct v6 /128     :", len(set(v6s)))
-          print("=== distinct v6 /48      :", len(p48), dict(p48))
-          print()
-          print("v4 addresses:")
-          for v, n in collections.Counter(v4s).most_common():
-              print("  %-16s x%d" % (v, n))
-          print()
-          verdict = "INCONCLUSIVE"
-          if len(v4s) >= 3:
-              verdict = ("registration DOES re-roll v4" if len(set(v4s)) >= len(v4s) * 0.8
-                         else "registration does NOT re-roll v4")
-          print("VERDICT:", verdict)
-          open("results/SUMMARY.txt", "w").write(
-              "measured=%d distinct_v4=%d distinct_v6=%d\nverdict=%s\n" %
-              (len(rows), len(set(v4s)), len(set(v6s)), verdict))
-          PYEOF
-          echo
-          cat results/SUMMARY.txt
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add results || true
-          git diff --cached --quiet || git commit -q -m "egress summary" || true
-          git push -q origin "${GITHUB_REF_NAME:-main}" || true
+          echo "=============================================="
+          echo "       WARP IP UNIQUENESS REPORT"
+          echo "=============================================="
+          echo ""
+
+          # Combine everything
+          find all-results -name "*.json" -exec cat {} \; 2>/dev/null | jq -s 'add // []' > combined.json || echo "[]" > combined.json
+
+          TOTAL=$(jq 'length' combined.json)
+          SUCCESS=$(jq '[.[] | select(.ipv4 != "FAILED" and .ipv4 != "" and .ipv4 != null)] | length' combined.json)
+          FAILED=$((TOTAL - SUCCESS))
+          UNIQUE=$(jq '[.[] | select(.ipv4 != "FAILED" and .ipv4 != "" and .ipv4 != null) | .ipv4] | unique | length' combined.json)
+
+          echo "Total registration attempts : $TOTAL"
+          echo "Successful (got IPv4)       : $SUCCESS"
+          echo "Failed                     : $FAILED"
+          echo "Unique IPv4 addresses      : $UNIQUE"
+          echo ""
+
+          if [ "$SUCCESS" -gt 0 ]; then
+            RATIO=$(echo "scale=1; $UNIQUE * 100 / $SUCCESS" | bc)
+            echo "Uniqueness ratio           : ${RATIO}%"
+          else
+            echo "Uniqueness ratio           : N/A"
+          fi
+
+          echo ""
+          echo "---------- IPv4 Frequency (most common first) ----------"
+          jq -r '.[] | select(.ipv4 != "FAILED" and .ipv4 != "" and .ipv4 != null) | .ipv4' combined.json \
+            | sort | uniq -c | sort -nr || echo "(none)"
+
+          echo ""
+          echo "---------- Duplicates only ----------"
+          jq -r '.[] | select(.ipv4 != "FAILED" and .ipv4 != "" and .ipv4 != null) | .ipv4' combined.json \
+            | sort | uniq -c | awk '$1 > 1 {printf "%3d ×  %s\n", $1, $2}' || echo "(no duplicates)"
+
+          echo ""
+          echo "---------- Full detailed list ----------"
+          jq -r '.[] | "Job \(.job)-\(.index)  →  \(.ipv4)  (\(.ipv6))"' combined.json || true
+
+          # Markdown summary
+          {
+            echo "# WARP Mint Results"
+            echo ""
+            echo "- **Total attempts**: $TOTAL"
+            echo "- **Successful**: $SUCCESS"
+            echo "- **Failed**: $FAILED"
+            echo "- **Unique IPv4s**: $UNIQUE"
+            echo ""
+            echo "## IPv4 Frequency"
+            echo '```'
+            jq -r '.[] | select(.ipv4 != "FAILED" and .ipv4 != "" and .ipv4 != null) | .ipv4' combined.json | sort | uniq -c | sort -nr
+            echo '```'
+            echo ""
+            echo "## Detailed List"
+            echo "| Job | Index | IPv4 | IPv6 |"
+            echo "|-----|-------|------|------|"
+            jq -r '.[] | "| \(.job) | \(.index) | \(.ipv4) | \(.ipv6) |"' combined.json
+          } > summary.md
+
+          echo ""
+          echo "=============================================="
+          cat summary.md
+
+      - name: Upload final report
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-report
+          path: |
+            combined.json
+            summary.md
+          retention-days: 5
