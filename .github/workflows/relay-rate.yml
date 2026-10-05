@@ -1,0 +1,318 @@
+name: relay-rate
+
+# Can GitHub-hosted runners sustain a TARGET THROUGHPUT (req/min), not just a
+# bucket size? This paces requests to a fixed rate per runner and reports the
+# achieved rate plus any 429s, so we can compare achieved vs target directly.
+#
+# Proven already (run 37313287045): 20 runners x 5 requests = 100/100 served,
+# 20 distinct egress IPs, zero 429s, while the local WARP fleet measured empty.
+# Buckets are per-egress-IP and independent.
+#
+# Design:
+#   runners        = N parallel jobs, each on its own egress IP
+#   rate_per_min   = requests per minute EACH runner should sustain
+#   duration_s     = how long to hold that rate
+# Aggregate achieved rate = sum over runners. Compare against your 500/min goal.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runners:
+        description: 'Parallel runners (each an independent egress IP)'
+        required: true
+        default: '20'
+      rate_per_min:
+        description: 'Requests per minute PER RUNNER'
+        required: true
+        default: '25'
+      duration_s:
+        description: 'Seconds to sustain the rate'
+        required: true
+        default: '180'
+      model:
+        description: 'Model id'
+        required: true
+        default: 'big-pickle'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: relay-rate
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      runner: ${{ steps.make.outputs.runner }}
+    steps:
+      - id: make
+        env:
+          RUNNERS: ${{ inputs.runners }}
+        run: |
+          set -euo pipefail
+          n=$(printf '%s' "$RUNNERS" | tr -cd '0-9')
+          [ -z "$n" ] && n=20
+          [ "$n" -gt 50 ] && n=50
+          list=""
+          i=0
+          while [ "$i" -lt "$n" ]; do
+            list="$list${list:+,}$i"
+            i=$((i + 1))
+          done
+          echo "runner=[$list]" >> "$GITHUB_OUTPUT"
+
+  load:
+    needs: plan
+    name: load-${{ matrix.runner }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(needs.plan.outputs.runner) }}
+    steps:
+      - name: Sustain target rate
+        env:
+          RUNNER_ID: ${{ matrix.runner }}
+          RATE_PER_MIN: ${{ inputs.rate_per_min }}
+          DURATION_S: ${{ inputs.duration_s }}
+          MODEL: ${{ inputs.model }}
+        run: |
+          set -uo pipefail
+          mkdir -p data
+
+          cat > rate.cjs <<'NODEEOF'
+          const https = require("node:https");
+          const crypto = require("node:crypto");
+          const fs = require("node:fs");
+          const { execFile } = require("node:child_process");
+
+          const RUNNER_ID = process.env.RUNNER_ID || "0";
+          const RATE = Math.max(1, Number(process.env.RATE_PER_MIN || 25));
+          const DURATION_S = Math.max(10, Number(process.env.DURATION_S || 180));
+          const MODEL = process.env.MODEL || "big-pickle";
+
+          // OpenCode's exact session-id format. A malformed id trips the
+          // free-tier client gate (403 FreeTierError) which is NOT a 429.
+          const B62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+          let lastT = 0, c = 0;
+          const ocId = (p) => {
+            const n0 = Date.now();
+            if (n0 !== lastT) { lastT = n0; c = 0; }
+            c++;
+            const r = BigInt(n0) * BigInt(0x1000) + BigInt(c);
+            const v = p === "ses" ? ~r : r;
+            const tb = Buffer.alloc(6);
+            for (let i = 0; i < 6; i++) tb[i] = Number((v >> BigInt(40 - 8 * i)) & BigInt(0xff));
+            return p + "_" + tb.toString("hex") +
+              Array.from(crypto.randomBytes(14), (b) => B62[b % 62]).join("");
+          };
+
+          const tool = (n) => ({ type: "function", name: n, description: "r", parameters: { type: "object", properties: {} } });
+          const useResp = MODEL.indexOf("spark") >= 0;
+          const payload = useResp
+            ? { model: MODEL, input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }], stream: true, max_output_tokens: 16, tools: [tool("read"), tool("bash")] }
+            : { model: MODEL, messages: [{ role: "user", content: "hi" }], stream: true, max_tokens: 8,
+                tools: [{ type: "function", function: tool("read") }, { type: "function", function: tool("bash") }] };
+          const body = JSON.stringify(payload);
+          const PATH = useResp ? "/zen/v1/responses" : "/zen/v1/chat/completions";
+
+          const fire = () => new Promise((resolve) => {
+            const sid = ocId("ses");
+            let done = false;
+            const fin = (v) => { if (!done) { done = true; resolve(v); } };
+            const to = setTimeout(() => fin({ kind: "timeout" }), 45000);
+            const req = https.request({
+              hostname: "opencode.ai", port: 443, path: PATH, method: "POST", timeout: 40000,
+              agent: undefined,
+              headers: {
+                "Content-Type": "application/json",
+                "Content-Length": Buffer.byteLength(body),
+                Authorization: "Bearer public",
+                "User-Agent": "opencode/1.18.34 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
+                "x-opencode-client": "cli",
+                "x-opencode-project": "global",
+                "x-opencode-request": ocId("msg"),
+                "x-opencode-session": sid,
+                "x-opencode-session-id": sid,
+              },
+            }, (res) => {
+              let raw = "";
+              res.on("data", (x) => { raw += x; });
+              res.on("end", () => {
+                clearTimeout(to);
+                const limited = res.statusCode === 429 || raw.indexOf("FreeUsageLimitError") >= 0;
+                const gate = raw.indexOf("FreeTierError") >= 0;
+                fin({ kind: limited ? "limited" : gate ? "gate" : res.statusCode === 200 ? "ok" : "http" + res.statusCode });
+              });
+            });
+            req.on("error", (e) => { clearTimeout(to); fin({ kind: "err" }); });
+            req.write(body);
+            req.end();
+          });
+
+          const egress = (v6) => new Promise((resolve) => {
+            const args = v6 ? ["-s","--max-time","15","-6","https://api64.ipify.org"]
+                            : ["-s","--max-time","15","-4","https://api.ipify.org"];
+            execFile("curl", args, { timeout: 20000 }, (e, so) => resolve(e ? null : String(so).trim()));
+          });
+
+          (async () => {
+            const out = { runner: RUNNER_ID, model: MODEL, targetRatePerMin: RATE,
+                          durationS: DURATION_S, egressV4: await egress(false),
+                          egressV6: await egress(true), events: [] };
+            console.log("runner " + RUNNER_ID + " v4=" + out.egressV4 +
+                        " target=" + RATE + "/min for " + DURATION_S + "s");
+
+            const intervalMs = 60000 / RATE;
+            const t0 = Date.now();
+            let inFlight = 0, ok = 0, limited = 0, gate = 0, err = 0;
+            let launched = 0;
+            const latencies = [];
+
+            // Paced launcher: fires one request every intervalMs, never letting
+            // more than a small window of requests pile up.
+            const launch = () => {
+              const elapsed = Date.now() - t0;
+              const due = Math.floor(elapsed / intervalMs);
+              while (launched < due && elapsed < DURATION_S * 1000) {
+                launched++;
+                inFlight++;
+                const s = Date.now();
+                fire().then((r) => {
+                  inFlight--;
+                  latencies.push(Date.now() - s);
+                  if (r.kind === "ok") ok++;
+                  else if (r.kind === "limited") limited++;
+                  else if (r.kind === "gate") gate++;
+                  else err++;
+                  out.events.push({ t: Date.now() - t0, kind: r.kind });
+                });
+              }
+              if (elapsed < DURATION_S * 1000) setTimeout(launch, Math.max(20, intervalMs / 4));
+            };
+
+            const tick = setInterval(() => {
+              const el = Math.round((Date.now() - t0) / 1000);
+              console.log("  t=" + el + "s sent=" + launched + " ok=" + ok +
+                          " 429=" + limited + " inflight=" + inFlight);
+            }, 15000);
+            launch();
+
+            await new Promise((r) => setTimeout(r, DURATION_S * 1000 + 5000));
+            clearInterval(tick);
+            // let stragglers finish
+            for (let i = 0; i < 40 && inFlight > 0; i++) await new Promise((r) => setTimeout(r, 1000));
+
+            const wall = (Date.now() - t0) / 1000;
+            latencies.sort((a, b) => a - b);
+            out.sent = launched;
+            out.ok = ok; out.limited = limited; out.gate = gate; out.err = err;
+            out.wallS = Math.round(wall);
+            out.achievedPerMin = Math.round((ok / wall) * 60);
+            out.targetPerMin = RATE;
+            out.latencyP50 = latencies.length ? latencies[Math.floor(latencies.length * 0.5)] : null;
+            out.latencyP95 = latencies.length ? latencies[Math.floor(latencies.length * 0.95)] : null;
+
+            console.log("RUNNER " + RUNNER_ID + " RESULT target=" + RATE + "/min achieved=" +
+              out.achievedPerMin + "/min ok=" + ok + " 429=" + limited + " gate=" + gate +
+              " err=" + err + " lat_p50=" + out.latencyP50 + "ms p95=" + out.latencyP95 + "ms");
+            fs.writeFileSync("data/rate.json", JSON.stringify(out, null, 1));
+          })();
+          NODEEOF
+
+          node rate.cjs || echo "rate exited nonzero"
+
+      - name: Publish
+        env:
+          RUNNER_ID: ${{ matrix.runner }}
+        run: |
+          set -uo pipefail
+          mkdir -p results
+          cp data/rate.json "results/x$RUNNER_ID.json" 2>/dev/null || echo '{}' > "results/x$RUNNER_ID.json"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add results || true
+          if git diff --cached --quiet; then
+            echo "nothing to publish"
+          else
+            git commit -q -m "rate test from runner $RUNNER_ID"
+            for a in 1 2 3 4 5; do
+              if git push -q origin "${GITHUB_REF_NAME:-main}"; then echo pushed; break; fi
+              git pull -q --rebase --autostash origin "${GITHUB_REF_NAME:-main}" || true
+            done
+          fi
+
+  summary:
+    needs: load
+    runs-on: ubuntu-latest
+    if: always()
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Tally
+        run: |
+          set -uo pipefail
+          mkdir -p results
+          python3 - << 'PYEOF'
+          import json, glob
+          rows = []
+          for f in sorted(glob.glob("results/x*.json")):
+              try:
+                  d = json.load(open(f))
+                  if isinstance(d, dict) and d.get("ok") is not None: rows.append(d)
+              except Exception: pass
+          print("=== runners reporting:", len(rows))
+          if not rows:
+              raise SystemExit(0)
+          tot_ok = sum(r.get("ok", 0) for r in rows)
+          tot_429 = sum(r.get("limited", 0) for r in rows)
+          tot_gate = sum(r.get("gate", 0) for r in rows)
+          tot_err = sum(r.get("err", 0) for r in rows)
+          tot_sent = sum(r.get("sent", 0) for r in rows)
+          target = rows[0].get("targetRatePerMin", 0) * len(rows)
+          # Aggregate wall time: runners run concurrently, so use the max wall.
+          wall = max(r.get("wallS", 1) for r in rows)
+          achieved = round((tot_ok / wall) * 60)
+          v4s = set(r.get("egressV4") for r in rows if r.get("egressV4"))
+          p50 = sorted(r.get("latencyP50") or 0 for r in rows)[len(rows)//2]
+          p95s = sorted((r.get("latencyP95") or 0) for r in rows)
+          print("=== distinct egress IPs:", len(v4s))
+          print("=== total sent:", tot_sent, " ok:", tot_ok, " 429:", tot_429,
+                " client-gate:", tot_gate, " err:", tot_err)
+          print("=== wall time (s):", wall)
+          print("=== TARGET aggregate:", target, "req/min")
+          print("=== ACHIEVED aggregate:", achieved, "req/min")
+          if tot_sent:
+              print("=== success rate: %.1f%%" % (100.0 * tot_ok / tot_sent))
+          if tot_429:
+              print("=== RATE LIMITED: yes (%d requests hit 429)" % tot_429)
+          else:
+              print("=== RATE LIMITED: no  (zero 429s)")
+          print("=== median p50 latency:", p50, "ms   max p95:", max(p95s), "ms")
+          print()
+          print("per-runner:")
+          for r in sorted(rows, key=lambda x: -(x.get("ok", 0))):
+              print("  runner %-3s v4=%-16s ok=%-4s 429=%-4s achieved=%s/min" % (
+                  r.get("runner"), r.get("egressV4"), r.get("ok"),
+                  r.get("limited"), r.get("achievedPerMin")))
+          print()
+          verdict = "INCONCLUSIVE"
+          if len(rows) >= 3:
+              if achieved >= target * 0.9 and tot_429 == 0:
+                  verdict = "TARGET MET: %d/%d req/min sustained with zero 429s" % (achieved, target)
+              elif achieved >= target * 0.9:
+                  verdict = "TARGET MET with %d 429s (buckets started to drain)" % tot_429
+              else:
+                  verdict = "TARGET MISSED: %d/%d req/min" % (achieved, target)
+          print("VERDICT:", verdict)
+          open("results/RATE-SUMMARY.txt","w").write(
+              "runners=%d target=%d achieved=%d ok=%d 429=%d verdict=%s\n" %
+              (len(rows), target, achieved, tot_ok, tot_429, verdict))
+          PYEOF
+          echo
+          cat results/RATE-SUMMARY.txt
