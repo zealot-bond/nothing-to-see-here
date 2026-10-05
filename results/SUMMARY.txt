@@ -1,0 +1,2 @@
+measured=0 distinct_v4=0 distinct_v6=0
+verdict=INCONCLUSIVE
