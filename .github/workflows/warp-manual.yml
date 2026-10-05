@@ -1,153 +1,354 @@
-name: Mint WARP Lanes (fixed)
+name: warp-manual
+
+# Rotates Cloudflare WARP registrations to obtain fresh egress IPs.
+#
+# Uses the official warp-cli (registration delete + registration new) rather
+# than the raw /v0a4005/reg API, because the raw API path appeared to reuse the
+# same egress IPv4 across registrations. Each GitHub Actions job gets its own
+# fresh VM (fresh /etc/machine-id), and each iteration inside a job performs a
+# full device re-registration, so every account should carry a distinct egress
+# IP. The egress IP is measured and stored so the effect can be verified.
+
+on:
+  workflow_dispatch:
+    inputs:
+      workers:
+        description: 'Parallel jobs (each on its own fresh VM)'
+        required: true
+        default: '8'
+      accounts_per_worker:
+        description: 'Full re-registrations per job'
+        required: true
+        default: '3'
 
 permissions:
   contents: write
 
-on:
-  schedule:
-    - cron: '*/30 * * * *'
-  workflow_dispatch:
-    inputs:
-      workers:
-        description: 'Parallel runners (distinct Azure IPs)'
-        required: true
-        default: '256'
-      accounts_per_worker:
-        description: 'Accounts per worker (<=5 per IP per minute)'
-        required: true
-        default: '5'
-
 concurrency:
-  group: warp-fixed-minter
+  group: warp-manual
   cancel-in-progress: false
 
+env:
+  ACCOUNTS_DIR: accounts
+
 jobs:
-  prepare-matrix:
+  plan:
+    name: plan-matrix
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      worker: ${{ steps.make.outputs.worker }}
     steps:
-      - id: set-matrix
+      - id: make
+        env:
+          WORKERS: ${{ inputs.workers }}
         run: |
-          COUNT="${{ github.event.inputs.workers || '5' }}"
-          MATRIX_JSON=$(node -e "console.log(JSON.stringify(Array.from({ length: Number('$COUNT') }, (_, i) => i + 1)))")
-          echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          n=$(echo "$WORKERS" | tr -cd '0-9')
+          [ -z "$n" ] && n=8
+          [ "$n" -gt 20 ] && n=20
+          list=""
+          i=0
+          while [ "$i" -lt "$n" ]; do
+            list="$list${list:+,}$i"
+            i=$((i + 1))
+          done
+          echo "worker=[$list]" >> "$GITHUB_OUTPUT"
 
   mint:
-    needs: prepare-matrix
+    needs: plan
+    name: mint-${{ matrix.worker }}
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        worker: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+        worker: ${{ fromJSON(needs.plan.outputs.worker) }}
     steps:
-      - name: Mint and ship lanes
-        env:
-          PANEL_URL: ${{ secrets.PANEL_URL }}
-          IMPORT_SECRET: ${{ secrets.IMPORT_SECRET }}
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          WORKER_ID: ${{ matrix.worker }}
-          RUN_ID: ${{ github.run_id }}
-          COUNT: ${{ github.event.inputs.accounts_per_worker || '5' }}
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Cloudflare WARP CLI
         run: |
-          node -e '
-          const crypto = require("node:crypto");
-          const https = require("node:https");
-          const postJson = (url, data, headers = {}, timeoutMs = 30000) => new Promise((resolve, reject) => {
-            const u = new URL(url);
-            const body = JSON.stringify(data);
-            const req = https.request({
-              hostname: u.hostname, port: u.port || 443, path: u.pathname + u.search, method: "POST",
-              headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body), ...headers },
-              timeout: timeoutMs,
-            }, (res) => {
-              let raw = "";
-              res.on("data", (c) => raw += c);
-              res.on("end", () => { try { resolve({ status: res.statusCode, data: JSON.parse(raw) }); }
-                catch { resolve({ status: res.statusCode, raw }); } });
-            });
-            req.on("error", reject);
-            req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
-            req.write(body); req.end();
-          });
-          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-          (async () => {
-            const target = Number(process.env.COUNT) || 5;
-            const accounts = [];
-            for (let i = 0; i < target; i++) {
-              const { privateKey, publicKey } = crypto.generateKeyPairSync("x25519", {
-                publicKeyEncoding: { type: "spki", format: "der" },
-                privateKeyEncoding: { type: "pkcs8", format: "der" },
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl gnupg lsb-release iproute2 wireguard-tools
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+            | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cloudflare-warp
+          sudo warp-cli --accept-tos --version || true
+
+      - name: Rotate registrations
+        env:
+          WORKER: ${{ matrix.worker }}
+          PER_WORKER: ${{ fromJSON(inputs.accounts_per_worker) }}
+        run: |
+          set -uo pipefail
+          sudo systemctl enable dbus >/dev/null 2>&1 || true
+          sudo systemctl start dbus  >/dev/null 2>&1 || true
+          sudo warp-svc >/var/log/warp-svc.log 2>&1 &
+          for i in $(seq 1 20); do
+            sudo warp-cli --accept-tos status >/dev/null 2>&1 && break
+            sleep 2
+          done
+          sudo warp-cli --accept-tos mode warp || true
+          sudo warp-cli --accept-tos tunnel protocol wireguard || true
+          mkdir -p "data"
+          echo "worker $WORKER starting, $PER_WORKER re-registrations"
+
+          cat > harvest.js <<'NODEEOF'
+          const { execFileSync } = require("node:child_process");
+          const fs = require("node:fs");
+
+          const PER_WORKER = Number(process.env.PER_WORKER || 3);
+          const WORKER = process.env.WORKER || "0";
+          const out = [];
+
+          const warp = (args, allowFail) => {
+            try {
+              return execFileSync("sudo", ["warp-cli", "--accept-tos", ...args], {
+                encoding: "utf8", timeout: 60000,
               });
-              const privB64 = privateKey.subarray(-32).toString("base64");
-              const pubB64 = publicKey.subarray(-32).toString("base64");
-              const installId = crypto.randomUUID();
-              let res;
+            } catch (e) {
+              if (!allowFail) throw e;
+              return String((e.stdout || "") + (e.stderr || ""));
+            }
+          };
+
+          // The exact method from alztrk/opencode-ip-rotator rotator.py:
+          // a full device re-registration, not a reconnect.
+          const rotate = () => {
+            warp(["disconnect"], true);
+            warp(["registration", "delete"], true);
+            warp(["registration", "new"], true);
+            warp(["connect"], true);
+          };
+
+          const parseWg = (text) => {
+            const priv = /PrivateKey\s*=\s*(\S+)/i.exec(text);
+            const addr = /Address\s*=\s*(\S+)/i.exec(text);
+            const pub = /PublicKey\s*=\s*(\S+)/i.exec(text);
+            const ep = /Endpoint\s*=\s*(\S+)/i.exec(text);
+            if (!priv || !addr || !pub || !ep) return null;
+            const reserved = /Reserved\s*=\s*([0-9,\s]+)/i.exec(text);
+            return {
+              privateKey: priv[1],
+              ipv6: addr[1],
+              peerKey: pub[1],
+              peerHost: ep[1].replace(/:(\d+)$/, ""),
+              peerPort: Number(/:(\d+)$/.exec(ep[1])?.[1] || 2408),
+              reserved: reserved
+                ? reserved[1].split(",").map((n) => Number(n.trim())).filter((n) => !Number.isNaN(n)).slice(0, 3)
+                : null,
+            };
+          };
+
+          // Reserved bytes are not printed by every warp-cli build. Dig them out
+          // of warp-svc state when the tunnel config omits them.
+          const reservedFromState = () => {
+            const cands = [
+              "/var/lib/cloudflare-warp",
+              "/etc/cloudflare-warp",
+              "/var/lib/warp-svc",
+              "/opt/cloudflare-warp",
+            ];
+            for (const dir of cands) {
+              let files = [];
+              try { files = execFileSync("sudo", ["find", dir, "-type", "f"], { encoding: "utf8" }).split("\n"); }
+              catch { continue; }
+              for (const f of files.filter(Boolean)) {
+                let txt = "";
+                try { txt = execFileSync("sudo", ["cat", f], { encoding: "utf8", timeout: 15000 }); } catch { continue; }
+                const m = /reserved["'\s:=]+([0-9]+)\s*,\s*([0-9]+)\s*,\s*([0-9]+)/i.exec(txt);
+                if (m) return [Number(m[1]), Number(m[2]), Number(m[3])];
+              }
+            }
+            return null;
+          };
+
+          // Egress IPv4 as seen from inside the tunnel. This is the value that
+          // determines which upstream rate-limit bucket a lane lands in.
+          const egressIpv4 = () => {
+            try {
+              const t = warp(["tunnel", "wireguard", "show"], true) || "";
+              return /IPv4\s*=\s*(\S+)/i.exec(t)?.[1] || null;
+            } catch { return null; }
+          };
+
+          for (let i = 0; i < PER_WORKER; i++) {
+            console.log(`[w${WORKER}] rotation ${i + 1}/${PER_WORKER}`);
+            rotate();
+
+            let parsed = null;
+            for (let a = 0; a < 6 && !parsed; a++) {
+              const show = warp(["tunnel", "wireguard", "show"], true) || "";
+              parsed = parseWg(show);
+              if (!parsed) {
+                const alt = warp(["tunnel", "wireguard", "export"], true) || "";
+                parsed = parseWg(alt);
+              }
+              if (!parsed) { console.log(`[w${WORKER}] config not ready, retry ${a + 1}`); warp(["connect"], true); await new Promise((r) => setTimeout(r, 8000)); }
+            }
+
+            if (!parsed) { console.log(`[w${WORKER}] rotation ${i + 1}: could not read wireguard config`); continue; }
+            if (!parsed.reserved || parsed.reserved.length !== 3) {
+              parsed.reserved = reservedFromState();
+              console.log(`[w${WORKER}] reserved from state: ${JSON.stringify(parsed.reserved)}`);
+            }
+
+            const acct = {
+              accountId: parsed.peerKey ? cryptoRandomId() : "unknown",
+              token: "",
+              privateKey: parsed.privateKey,
+              reserved: parsed.reserved || [0, 0, 0],
+              ipv6: parsed.ipv6.replace("/128", ""),
+              peerKey: parsed.peerKey,
+              peerHost: parsed.peerHost,
+              peerPort: parsed.peerPort,
+              createdAt: new Date().toISOString(),
+              egressIpv4: null,
+              source: "warp-cli",
+              worker: WORKER,
+              rotation: i + 1,
+            };
+            acct.egressIpv4 = egressIpv4();
+            console.log(`[w${WORKER}] v6=${acct.ipv6} v4=${acct.egressIpv4 || "unknown"}`);
+            out.push(acct);
+            fs.writeFileSync("data/collected.json", JSON.stringify(out, null, 1));
+            await new Promise((r) => setTimeout(r, 12000));
+          }
+
+          function cryptoRandomId() {
+            const c = require("node:crypto");
+            return c.randomUUID();
+          }
+
+          fs.writeFileSync("data/collected.json", JSON.stringify(out, null, 1));
+          console.log(`[w${WORKER}] collected ${out.length}`);
+          NODEEOF
+
+          node harvest.js || echo "harvest exited nonzero"
+          echo "--- collected ---"
+          cat data/collected.json 2>/dev/null | head -c 400 || echo "none"
+
+      - name: Verify each account with a real upstream request
+        env:
+          WORKER: ${{ matrix.worker }}
+        run: |
+          set -uo pipefail
+          cat > verify.js <<'NODEEOF'
+          const { execFileSync, spawn } = require("node:child_process");
+          const fs = require("node:fs");
+
+          const SB = process.env.SB_PATH || "sing-box";
+          const raw = fs.existsSync("data/collected.json") ? fs.readFileSync("data/collected.json", "utf8") : "[]";
+          const accts = JSON.parse(raw || "[]");
+
+          // Ask a service what address the tunnel exits from.
+          const probeEgress = (a, port) => new Promise((resolve) => {
+            const cfgPath = `/tmp/wg-${port}.json`;
+            const cfg = {
+              log: { level: "error" },
+              dns: { servers: [{ tag: "cf", address: "https://1.1.1.1/dns-query" }], strategy: "ipv4_only" },
+              inbounds: [{ type: "mixed", tag: "in", listen: "127.0.0.1", listen_port: port }],
+              endpoints: [{
+                type: "wireguard", tag: "wg",
+                address: ["172.16.0.2/32", a.ipv6 + "/128"],
+                private_key: a.privateKey,
+                peers: [{
+                  address: a.peerHost, port: a.peerPort, public_key: a.peerKey,
+                  allowed_ips: ["0.0.0.0/0", "::/0"],
+                  reserved: a.reserved,
+                }],
+              }],
+              outbounds: [{ type: "direct", tag: "direct" }],
+              route: { rules: [{ inbound: "in", outbound: "wg" }] },
+            };
+            fs.writeFileSync(cfgPath, JSON.stringify(cfg));
+            const p = spawn(SB, ["run", "-c", cfgPath], { stdio: ["ignore", "ignore", "pipe"] });
+            let err = "";
+            p.stderr.on("data", (d) => { err += d; });
+            setTimeout(async () => {
               try {
-                res = await postJson("https://api.cloudflareclient.com/v0a4005/reg", {
-                  install_id: installId,
-                  fcm_token: installId + ":APA91b" + crypto.randomBytes(32).toString("base64url"),
-                  tos: new Date().toISOString().slice(0, 19) + ".000Z",
-                  model: "PC", serial_number: installId, locale: "en_US", key: pubB64,
-                }, { "User-Agent": "okhttp/4.12.0" });
-              } catch (e) { console.error("net error, stopping job:", e.message); break; }
-              if (res.status === 429) { console.log("throttled, stopping job (cron resumes)"); break; }
-              if (res.status !== 200 || !res.data?.id || !res.data?.config) { console.error("reg failed:", res.status); break; }
-              const j = res.data;
-              accounts.push({
-                accountId: j.id, token: j.token, privateKey: privB64,
-                reserved: [...Buffer.from(j.config.client_id, "base64")],
-                ipv6: j.config.interface.addresses.v6,
-                peerKey: j.config.peers[0].public_key,
-                peerHost: "engage.cloudflareclient.com", peerPort: 2408,
-                createdAt: new Date().toISOString(),
-              });
-              process.stdout.write("+");
-              await sleep(5000); // Azure runners sustain this pace; stop-on-429 guards the rest
+                const out = execFileSync("curl", [
+                  "-s", "--max-time", "20", "--socks5-hostname", `127.0.0.1:${port}`,
+                  "https://api.ipify.org",
+                ], { encoding: "utf8", timeout: 30000 }).trim();
+                p.kill("SIGKILL");
+                resolve({ v4: out || null, err });
+              } catch (e) {
+                p.kill("SIGKILL");
+                resolve({ v4: null, err: err.replace(/\x1b\[[0-9;]*m/g, "").slice(0, 120) });
+              }
+            }, 9000);
+          });
+
+          (async () => {
+            const usable = [];
+            let port = 45000 + Math.floor(Number(process.env.WORKER || 0)) * 10;
+            for (const a of accts) {
+              const { v4, err } = await probeEgress(a, port++);
+              const ok = v4 && /^\d+\.\d+\.\d+\.\d+$/.test(v4);
+              console.log(`acct=${a.accountId.slice(0, 8)} v6=${a.ipv6} egress=${v4 || "FAIL"} ${ok ? "USABLE" : err}`);
+              if (ok) {
+                a.egressIpv4 = v4;
+                a.verified = true;
+                usable.push(a);
+              }
+              await new Promise((r) => setTimeout(r, 2000));
             }
-            console.log(`\nminted ${accounts.length}, committing to repo...`);
-            if (!accounts.length) return;
-            // Direction 1 (primary): push straight to the panel (instant).
-            const headers = { "x-import-secret": process.env.IMPORT_SECRET };
-            const payload = { version: 1, accounts };
-            const base = ((process.env.PANEL_URL || "").trim() || "http://160.187.210.9:25566").replace(/\/+$/, "");
-            try {
-              const out = await postJson(base + "/app/import", payload, headers);
-              console.log("panel push:", out.status, JSON.stringify(out.data).slice(0, 160));
-            } catch (e) {
-              console.error("panel push failed (pull will cover it): " + e.message);
-            }
-            // Direction 2 (fallback): commit this workers batch so the panel
-            // pulls it even when runners cannot reach the panel inbound.
-            try {
-              const repo = process.env.GH_REPO;
-              // Unique per run+worker: concurrent runs (cron + manual) can
-              // never collide on the same file. Panel dedupes by accountId,
-              // so re-pulled or overlapping batches are harmless.
-              const filePath = `accounts/r${process.env.RUN_ID || "local"}-w${process.env.WORKER_ID || "0"}.json`;
-              const putBody = {
-                message: `warp accounts batch run ${process.env.RUN_ID || "local"} worker ${process.env.WORKER_ID || "0"}`,
-                content: Buffer.from(JSON.stringify(payload)).toString("base64"),
-              };
-              const put = await new Promise((resolve, reject) => {
-                const https = require("node:https");
-                const data = JSON.stringify(putBody);
-                const req = https.request(`https://api.github.com/repos/${repo}/contents/${filePath}`, {
-                  method: "PUT",
-                  headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data),
-                    Authorization: "Bearer " + process.env.GH_TOKEN, Accept: "application/vnd.github+json", "User-Agent": "warp-minter" },
-                }, (res) => {
-                  let raw = "";
-                  res.on("data", (c) => { raw += c; });
-                  res.on("end", () => resolve({ status: res.statusCode, raw: raw.slice(0, 200) }));
-                });
-                req.on("error", reject);
-                req.write(data); req.end();
-              });
-              console.log("repo commit:", put.status);
-            } catch (e) {
-              console.error("repo commit failed: " + e.message);
-            }
-          })().catch((e) => { console.error("failed:", e); process.exit(1); });
-          '
+            fs.writeFileSync("data/usable.json", JSON.stringify(usable, null, 1));
+            console.log(`usable ${usable.length}/${accts.length}`);
+          })();
+          NODEEOF
+          # sing-box is not preinstalled on runners; grab it so tunnels can be verified.
+          if ! command -v sing-box >/dev/null 2>&1; then
+            curl -fsSL -o /tmp/sb.tgz https://github.com/SagerNet/sing-box/releases/download/v1.11.4/sing-box-1.11.4-linux-amd64.tar.gz \
+              && tar -xzf /tmp/sb.tgz -C /tmp \
+              && sudo install -m 0755 /tmp/sing-box-1.11.4-linux-amd64/sing-box /usr/local/bin/sing-box \
+              || echo "sing-box download failed"
+          fi
+          node verify.js || echo "verify exited nonzero"
+
+      - name: Commit accounts
+        env:
+          WORKER: ${{ matrix.worker }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          mkdir -p "$ACCOUNTS_DIR"
+          if [ ! -s data/usable.json ]; then
+            echo "no verified accounts from worker $WORKER"
+            exit 0
+          fi
+          RUN_ID="${{ github.run_id }}"
+          python3 - <<'PYEOF'
+          import json, os, pathlib
+          data = json.load(open("data/usable.json"))
+          d = pathlib.Path(os.environ["ACCOUNTS_DIR"])
+          out = []
+          for a in data:
+              a.pop("verified", None)
+              out.append(a)
+              if len(out) >= 5:
+                  break
+          fn = d / f"cli-r{os.environ.get('RUN_ID','0')}-w{os.environ['WORKER']}.json"
+          fn.write_text(json.dumps({"accounts": out}, indent=1))
+          print("wrote", fn, len(out))
+          PYEOF
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$ACCOUNTS_DIR" || true
+          if git diff --cached --quiet; then
+            echo "nothing new to commit"
+          else
+            git commit -m "warp-cli re-registrations from worker $WORKER (run ${{ github.run_id }})"
+            for attempt in 1 2 3 4 5; do
+              if git push; then echo "pushed"; break; fi
+              echo "push attempt $attempt failed, rebasing"
+              git pull --rebase --autostash origin "${GITHUB_REF_NAME:-main}" || true
+              sleep 5
+            done
+          fi
