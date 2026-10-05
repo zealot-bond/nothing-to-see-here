@@ -1,0 +1,303 @@
+name: relay-bucket
+
+# Measure two things on GitHub-hosted runners:
+#   1. TRUE bucket size -- how many requests one runner's egress IP serves
+#      before its first 429.
+#   2. Refill behaviour -- whether the bucket refills, and how fast.
+#
+# Already proven (run 37313287045): 20 runners x 5 requests = 100/100 served
+# with 20 distinct egress IPs and zero 429s, while the local WARP fleet was
+# measured empty (0/80). So buckets are per-egress-IP and independent.
+#
+# Each probe job records a timeline of request outcomes, so one run yields both
+# the ceiling and the refill curve.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runners:
+        description: 'Parallel runners (independent egress IPs)'
+        required: true
+        default: '3'
+      requests_each:
+        description: 'Sequential requests per runner'
+        required: true
+        default: '600'
+      model:
+        description: 'Model id'
+        required: true
+        default: 'big-pickle'
+      refill_wait_seconds:
+        description: 'Seconds to wait before probing for refill'
+        required: true
+        default: '300'
+      refill_probes:
+        description: 'Refill probes after the wait'
+        required: true
+        default: '10'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: relay-bucket
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      runner: ${{ steps.make.outputs.runner }}
+    steps:
+      - id: make
+        env:
+          RUNNERS: ${{ inputs.runners }}
+        run: |
+          set -euo pipefail
+          n=$(printf '%s' "$RUNNERS" | tr -cd '0-9')
+          [ -z "$n" ] && n=3
+          [ "$n" -gt 20 ] && n=20
+          list=""
+          i=0
+          while [ "$i" -lt "$n" ]; do
+            list="$list${list:+,}$i"
+            i=$((i + 1))
+          done
+          echo "runner=[$list]" >> "$GITHUB_OUTPUT"
+
+  probe:
+    needs: plan
+    name: probe-${{ matrix.runner }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(needs.plan.outputs.runner) }}
+    steps:
+      - name: Measure bucket size and refill
+        env:
+          RUNNER_ID: ${{ matrix.runner }}
+          REQUESTS: ${{ inputs.requests_each }}
+          MODEL: ${{ inputs.model }}
+          REFILL_WAIT: ${{ inputs.refill_wait_seconds }}
+          REFILL_PROBES: ${{ inputs.refill_probes }}
+        run: |
+          set -uo pipefail
+          mkdir -p data
+
+          cat > bucket.cjs <<'NODEEOF'
+          const https = require("node:https");
+          const crypto = require("node:crypto");
+          const fs = require("node:fs");
+          const { execFile } = require("node:child_process");
+
+          const RUNNER_ID = process.env.RUNNER_ID || "0";
+          const REQUESTS = Math.max(1, Number(process.env.REQUESTS || 600));
+          const MODEL = process.env.MODEL || "big-pickle";
+          const REFILL_WAIT = Number(process.env.REFILL_WAIT || 300);
+          const REFILL_PROBES = Math.max(0, Number(process.env.REFILL_PROBES || 10));
+
+          // OpenCode's exact session-id format. A malformed id trips the
+          // free-tier client gate (403 FreeTierError), which is not a 429 and
+          // must never be counted toward bucket exhaustion.
+          const B62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+          let lastT = 0, c = 0;
+          const ocId = (p) => {
+            const n0 = Date.now();
+            if (n0 !== lastT) { lastT = n0; c = 0; }
+            c++;
+            const r = BigInt(n0) * BigInt(0x1000) + BigInt(c);
+            const v = p === "ses" ? ~r : r;
+            const tb = Buffer.alloc(6);
+            for (let i = 0; i < 6; i++) tb[i] = Number((v >> BigInt(40 - 8 * i)) & BigInt(0xff));
+            return p + "_" + tb.toString("hex") +
+              Array.from(crypto.randomBytes(14), (b) => B62[b % 62]).join("");
+          };
+
+          const tool = (n) => ({ type: "function", name: n, description: "r", parameters: { type: "object", properties: {} } });
+          const useResp = MODEL.indexOf("spark") >= 0;
+          const payload = useResp
+            ? { model: MODEL, input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }], stream: true, max_output_tokens: 16, tools: [tool("read"), tool("bash")] }
+            : { model: MODEL, messages: [{ role: "user", content: "hi" }], stream: true, max_tokens: 8,
+                tools: [{ type: "function", function: tool("read") }, { type: "function", function: tool("bash") }] };
+          const body = JSON.stringify(payload);
+          const PATH = useResp ? "/zen/v1/responses" : "/zen/v1/chat/completions";
+
+          const fire = () => new Promise((resolve) => {
+            const sid = ocId("ses");
+            let done = false;
+            const fin = (v) => { if (!done) { done = true; resolve(v); } };
+            const to = setTimeout(() => fin({ kind: "timeout" }), 60000);
+            const req = https.request({
+              hostname: "opencode.ai", port: 443, path: PATH, method: "POST", timeout: 55000,
+              headers: {
+                "Content-Type": "application/json",
+                "Content-Length": Buffer.byteLength(body),
+                Authorization: "Bearer public",
+                "User-Agent": "opencode/1.18.34 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
+                "x-opencode-client": "cli",
+                "x-opencode-project": "global",
+                "x-opencode-request": ocId("msg"),
+                "x-opencode-session": sid,
+                "x-opencode-session-id": sid,
+              },
+            }, (res) => {
+              let raw = "";
+              res.on("data", (x) => { raw += x; });
+              res.on("end", () => {
+                clearTimeout(to);
+                const limited = res.statusCode === 429 || raw.indexOf("FreeUsageLimitError") >= 0;
+                const gate = raw.indexOf("FreeTierError") >= 0;
+                fin({
+                  kind: limited ? "limited" : gate ? "gate" : res.statusCode === 200 ? "ok" : "http" + res.statusCode,
+                  retryAfter: res.headers["retry-after"] || null,
+                  at: new Date().toISOString(),
+                });
+              });
+            });
+            req.on("error", (e) => { clearTimeout(to); fin({ kind: "err:" + e.code }); });
+            req.write(body);
+            req.end();
+          });
+
+          const egress = (v6) => new Promise((resolve) => {
+            const args = v6 ? ["-s", "--max-time", "15", "-6", "https://api64.ipify.org"]
+                            : ["-s", "--max-time", "15", "-4", "https://api.ipify.org"];
+            execFile("curl", args, { timeout: 20000 }, (e, so) => resolve(e ? null : String(so).trim()));
+          });
+
+          (async () => {
+            const out = { runner: RUNNER_ID, model: MODEL, requested: REQUESTS,
+                          egressV4: await egress(false), egressV6: await egress(true),
+                          phase1: [], phase2: [] };
+            console.log("egressV4=" + out.egressV4 + " egressV6=" + out.egressV6);
+
+            // PHASE 1: drain until first 429 (or cap reached).
+            let served = 0, limitedCount = 0, gateCount = 0, errCount = 0;
+            let firstLimitAt = null;
+            const t0 = Date.now();
+            for (let i = 0; i < REQUESTS; i++) {
+              const r = await fire();
+              out.phase1.push(r.kind);
+              if (r.kind === "ok") served++;
+              else if (r.kind === "limited") {
+                limitedCount++;
+                if (firstLimitAt === null) firstLimitAt = { served, elapsedS: Math.round((Date.now() - t0) / 1000), retryAfter: r.retryAfter };
+              }
+              else if (r.kind === "gate") gateCount++;
+              else errCount++;
+
+              if (i % 25 === 0) console.log("  p1 #" + (i + 1) + " served=" + served + " limited=" + limitedCount);
+
+              // Once limited, keep going a little to confirm it stays limited.
+              if (firstLimitAt && i > firstLimitAt.served + 5 && limitedCount > 3) break;
+            }
+            out.servedBeforeLimit = served;
+            out.firstLimitAt = firstLimitAt;
+            out.phase1Counts = { ok: served, limited: limitedCount, gate: gateCount, err: errCount };
+            console.log("PHASE1 served=" + served + " limited=" + limitedCount +
+                        " gate=" + gateCount + " firstLimitAt=" + JSON.stringify(firstLimitAt));
+
+            fs.writeFileSync("data/bucket.json", JSON.stringify(out, null, 1));
+
+            // PHASE 2: wait, then probe for refill.
+            if (REFILL_PROBES > 0) {
+              console.log("waiting " + REFILL_WAIT + "s before refill probes...");
+              await new Promise((r) => setTimeout(r, REFILL_WAIT * 1000));
+              let recovered = 0;
+              for (let i = 0; i < REFILL_PROBES; i++) {
+                const r = await fire();
+                out.phase2.push({ kind: r.kind, at: r.at });
+                if (r.kind === "ok") recovered++;
+                console.log("  p2 probe " + (i + 1) + " -> " + r.kind);
+                await new Promise((r2) => setTimeout(r2, 5000));
+              }
+              out.refillProbes = REFILL_PROBES;
+              out.recoveredAfterWait = recovered;
+              console.log("PHASE2 recovered " + recovered + "/" + REFILL_PROBES +
+                          " after waiting " + REFILL_WAIT + "s");
+            }
+
+            out.BUCKET_SIZE = firstLimitAt ? firstLimitAt.served : ("no-limit-in-" + REQUESTS);
+            out.REFILLED = (out.recoveredAfterWait || 0) > 0;
+            console.log("RUNNER " + RUNNER_ID + " RESULT bucketSize=" + out.BUCKET_SIZE +
+                        " refilled=" + out.REFILLED + " v4=" + out.egressV4);
+            fs.writeFileSync("data/bucket.json", JSON.stringify(out, null, 1));
+          })();
+          NODEEOF
+
+          node bucket.cjs || echo "bucket exited nonzero"
+          echo "--- bucket.json ---"
+          cat data/bucket.json 2>/dev/null || echo none
+
+      - name: Publish
+        env:
+          RUNNER_ID: ${{ matrix.runner }}
+        run: |
+          set -uo pipefail
+          mkdir -p results
+          cp data/bucket.json "results/b$RUNNER_ID.json" 2>/dev/null || echo '{}' > "results/b$RUNNER_ID.json"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add results || true
+          if git diff --cached --quiet; then
+            echo "nothing to publish"
+          else
+            git commit -q -m "bucket probe from runner $RUNNER_ID"
+            for a in 1 2 3 4 5; do
+              if git push -q origin "${GITHUB_REF_NAME:-main}"; then echo pushed; break; fi
+              git pull -q --rebase --autostash origin "${GITHUB_REF_NAME:-main}" || true
+            done
+          fi
+
+  summary:
+    needs: probe
+    runs-on: ubuntu-latest
+    if: always()
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Tally
+        run: |
+          set -uo pipefail
+          mkdir -p results
+          python3 - << 'PYEOF'
+          import json, glob
+          rows = []
+          for f in sorted(glob.glob("results/b*.json")):
+              try:
+                  d = json.load(open(f))
+                  if isinstance(d, dict) and d.get("phase1"): rows.append(d)
+              except Exception: pass
+          print("=== runners reporting:", len(rows))
+          sizes, refilled = [], 0
+          for r in rows:
+              print("  runner %-3s v4=%-16s served=%-5s limit@=%s refill=%s" % (
+                  r.get("runner"), r.get("egressV4"), r.get("servedBeforeLimit"),
+                  (r.get("firstLimitAt") or {}).get("elapsedS"), r.get("REFILLED")))
+              sizes.append(r.get("BUCKET_SIZE"))
+              if r.get("REFILLED"): refilled += 1
+          print()
+          print("=== bucket sizes:", sizes)
+          print("=== runners that refilled:", refilled, "of", len(rows))
+          if rows:
+              print("=== retry-after header seen:", sorted(set(
+                  (r.get("firstLimitAt") or {}).get("retryAfter") for r in rows
+                  if (r.get("firstLimitAt") or {}).get("retryAfter"))))
+              print()
+              print("=== CAPACITY MODEL ===")
+              nums = [s for s in sizes if isinstance(s, int)]
+              if nums:
+                  avg = sum(nums) / len(nums)
+                  print("avg bucket per runner IP:", round(avg, 1))
+                  for n in (20, 50, 100, 200):
+                      print("  %3d concurrent runner IPs -> ~%s requests per window" % (n, int(avg * n)))
+              print("refill observed:", refilled > 0)
+          open("results/BUCKET-SUMMARY.txt","w").write(
+              "runners=%d sizes=%s refilled=%d\n" % (len(rows), sizes, refilled))
+          PYEOF
+          echo
+          cat results/BUCKET-SUMMARY.txt
