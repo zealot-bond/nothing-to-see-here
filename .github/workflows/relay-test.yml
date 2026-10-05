@@ -77,8 +77,8 @@ jobs:
       - name: Probe upstream from this runner
         env:
           RUNNER_ID: ${{ matrix.runner }}
-          REQUESTS: ${{ fromJSON(inputs.requests_each) }}
-          MODEL: ${{ fromJSON(inputs.model) }}
+          REQUESTS: ${{ inputs.requests_each }}
+          MODEL: ${{ inputs.model }}
         run: |
           set -uo pipefail
           mkdir -p data
