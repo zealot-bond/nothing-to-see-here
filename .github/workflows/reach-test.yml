@@ -1,0 +1,20 @@
+name: reach-test
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    name: probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: can runners reach the panel?
+        run: |
+          set -uo pipefail
+          for target in "http://160.187.210.9:25566/health" "https://api.ipify.org" "https://api.github.com"; do
+            echo "=== $target"
+            curl -s -o /dev/null -w "  http_code=%{http_code} time=%{time_total}s\n" --max-time 12 "$target" || echo "  CURL_FAILED exit=$?"
+          done
+          echo "=== raw tcp to panel"
+          timeout 8 bash -c 'cat < /dev/null > /dev/tcp/160.187.210.9/25566' 2>&1 && echo "  tcp OK" || echo "  tcp FAILED"
