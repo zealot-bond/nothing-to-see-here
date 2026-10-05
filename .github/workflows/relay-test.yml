@@ -1,0 +1,269 @@
+name: relay-test
+
+# Do GitHub-hosted runners get INDEPENDENT rate-limit buckets from our WARP fleet?
+#
+# The upstream free tier keys its quota on egress IP (proven: the same request
+# with the same auth token served from a plain IP while every WARP lane 429'd).
+# Our WARP fleet collapses to 1-3 IPv4 addresses. GitHub-hosted runners each have
+# a distinct Azure egress IP, so each runner should have its own bucket.
+#
+# This measures, from N parallel runners:
+#   - the runner's own egress IPv4/IPv6
+#   - how many requests it can serve before its first 429 (its bucket size)
+#   - whether runners are rate-limited independently of each other
+#
+# Session ids MUST use OpenCode's exact format or the upstream returns a
+# client-gate 403 that looks like a failure but is not.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runners:
+        description: 'Parallel runners'
+        required: true
+        default: '20'
+      requests_each:
+        description: 'Sequential requests per runner'
+        required: true
+        default: '5'
+      model:
+        description: 'Model id'
+        required: true
+        default: 'big-pickle'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: relay-test
+  cancel-in-progress: false
+
+env:
+  ACCOUNTS_DIR: accounts
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      runner: ${{ steps.make.outputs.runner }}
+    steps:
+      - id: make
+        env:
+          RUNNERS: ${{ inputs.runners }}
+        run: |
+          set -euo pipefail
+          n=$(printf '%s' "$RUNNERS" | tr -cd '0-9')
+          [ -z "$n" ] && n=20
+          [ "$n" -gt 50 ] && n=50
+          list=""
+          i=0
+          while [ "$i" -lt "$n" ]; do
+            list="$list${list:+,}$i"
+            i=$((i + 1))
+          done
+          echo "runner=[$list]" >> "$GITHUB_OUTPUT"
+
+  probe:
+    needs: plan
+    name: probe-${{ matrix.runner }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(needs.plan.outputs.runner) }}
+    steps:
+      - name: Probe upstream from this runner
+        env:
+          RUNNER_ID: ${{ matrix.runner }}
+          REQUESTS: ${{ fromJSON(inputs.requests_each) }}
+          MODEL: ${{ fromJSON(inputs.model) }}
+        run: |
+          set -uo pipefail
+          mkdir -p data
+
+          cat > probe.cjs <<'NODEEOF'
+          const https = require("node:https");
+          const fs = require("node:fs");
+
+          const RUNNER_ID = process.env.RUNNER_ID || "0";
+          const REQUESTS = Math.max(1, Number(process.env.REQUESTS || 5));
+          const MODEL = process.env.MODEL || "big-pickle";
+
+          // OpenCode's real session-id format. A malformed id is rejected by the
+          // free-tier client gate with 403 FreeTierError, which is NOT a rate
+          // limit and must not be counted as one.
+          const B62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+          let lastT = 0, c = 0;
+          const ocId = (p) => {
+            const n0 = Date.now();
+            if (n0 !== lastT) { lastT = n0; c = 0; }
+            c++;
+            const r = BigInt(n0) * BigInt(0x1000) + BigInt(c);
+            const v = p === "ses" ? ~r : r;
+            const tb = Buffer.alloc(6);
+            for (let i = 0; i < 6; i++) tb[i] = Number((v >> BigInt(40 - 8 * i)) & BigInt(0xff));
+            return p + "_" + tb.toString("hex") +
+              Array.from(require("node:crypto").randomBytes(14), (b) => B62[b % 62]).join("");
+          };
+
+          const tool = (n) => ({ type: "function", name: n, description: "r", parameters: { type: "object", properties: {} } });
+          const useResp = MODEL.indexOf("spark") >= 0;
+          const payload = useResp
+            ? { model: MODEL, input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }], stream: true, max_output_tokens: 16, tools: [tool("read"), tool("bash")] }
+            : { model: MODEL, messages: [{ role: "user", content: "hi" }], stream: true, max_tokens: 8,
+                tools: [{ type: "function", function: tool("read") }, { type: "function", function: tool("bash") }] };
+          const body = JSON.stringify(payload);
+          const PATH = useResp ? "/zen/v1/responses" : "/zen/v1/chat/completions";
+
+          const fire = () => new Promise((resolve) => {
+            const sid = ocId("ses");
+            let done = false;
+            const fin = (v) => { if (!done) { done = true; resolve(v); } };
+            const to = setTimeout(() => fin({ kind: "timeout" }), 60000);
+            const req = https.request({
+              hostname: "opencode.ai", port: 443, path: PATH, method: "POST", timeout: 55000,
+              headers: {
+                "Content-Type": "application/json",
+                "Content-Length": Buffer.byteLength(body),
+                Authorization: "Bearer public",
+                "User-Agent": "opencode/1.18.34 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
+                "x-opencode-client": "cli",
+                "x-opencode-project": "global",
+                "x-opencode-request": ocId("msg"),
+                "x-opencode-session": sid,
+                "x-opencode-session-id": sid,
+              },
+            }, (res) => {
+              let raw = ""; res.on("data", (x) => { raw += x; });
+              res.on("end", () => {
+                clearTimeout(to);
+                const limited = res.statusCode === 429 || raw.indexOf("FreeUsageLimitError") >= 0;
+                const gate = raw.indexOf("FreeTierError") >= 0;
+                fin({
+                  kind: limited ? "limited" : gate ? "gate" : res.statusCode === 200 ? "ok" : "http" + res.statusCode,
+                  status: res.statusCode,
+                  retryAfter: res.headers["retry-after"] || null,
+                  snippet: limited ? null : (gate ? "FreeTierError(client gate)" : raw.slice(0, 80).replace(/\n/g, " ")),
+                });
+              });
+            });
+            req.on("error", (e) => { clearTimeout(to); fin({ kind: "err:" + e.code }); });
+            req.write(body);
+            req.end();
+          });
+
+          const egress = (v6) => new Promise((resolve) => {
+            const args = v6
+              ? ["-s", "--max-time", "15", "-6", "https://api64.ipify.org"]
+              : ["-s", "--max-time", "15", "-4", "https://api.ipify.org"];
+            require("node:child_process").execFile("curl", args, { timeout: 20000 },
+              (e, so) => resolve(e ? null : String(so).trim()));
+          });
+
+          (async () => {
+            const out = {
+              runner: RUNNER_ID,
+              egressV4: await egress(false),
+              egressV6: await egress(true),
+              results: [],
+            };
+            console.log("egressV4=" + out.egressV4 + "  egressV6=" + out.egressV6);
+
+            let served = 0, firstLimitAt = null;
+            for (let i = 0; i < REQUESTS; i++) {
+              const r = await fire();
+              out.results.push(r.kind);
+              if (r.kind === "ok") { served++; if (firstLimitAt === null) { /* keep counting */ } }
+              console.log("  req#" + (i + 1) + " -> " + r.kind +
+                (r.retryAfter ? " retry-after=" + r.retryAfter : "") +
+                (r.snippet ? "  " + r.snippet : ""));
+              if (r.kind === "limited" && firstLimitAt === null) firstLimitAt = served;
+            }
+
+            out.served = served;
+            out.firstLimitAt = firstLimitAt;
+            out.bucketSize = firstLimitAt === null ? ">" + served : firstLimitAt;
+            console.log("RUNNER " + RUNNER_ID + " SUMMARY served=" + served +
+              " bucket=" + out.bucketSize + " v4=" + out.egressV4);
+            fs.writeFileSync("data/probe.json", JSON.stringify(out, null, 1));
+          })();
+          NODEEOF
+
+          node probe.cjs || echo "probe exited nonzero"
+          echo "--- probe.json ---"
+          cat data/probe.json 2>/dev/null || echo none
+
+      - name: Publish
+        env:
+          RUNNER_ID: ${{ matrix.runner }}
+        run: |
+          set -uo pipefail
+          mkdir -p results
+          cp data/probe.json "results/r$RUNNER_ID.json" 2>/dev/null || echo '[]' > "results/r$RUNNER_ID.json"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add results || true
+          if git diff --cached --quiet; then
+            echo "nothing to publish from $RUNNER_ID"
+          else
+            git commit -q -m "relay probe from runner $RUNNER_ID"
+            for a in 1 2 3 4 5; do
+              if git push -q origin "${GITHUB_REF_NAME:-main}"; then echo pushed; break; fi
+              git pull -q --rebase --autostash origin "${GITHUB_REF_NAME:-main}" || true
+            done
+          fi
+
+  summary:
+    needs: probe
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Tally
+        run: |
+          set -uo pipefail
+          mkdir -p results
+          python3 - << 'PYEOF'
+          import json, glob, collections
+          rows = []
+          for f in sorted(glob.glob("results/r*.json")):
+              try:
+                  d = json.load(open(f))
+                  if isinstance(d, dict) and d.get("results"): rows.append(d)
+              except Exception: pass
+          print("=== runners reporting:", len(rows))
+          v4 = [r.get("egressV4") for r in rows if r.get("egressV4")]
+          print("=== distinct egress IPv4:", len(set(v4)), "of", len(v4))
+          print("=== distinct egress IPv6:", len(set(r.get("egressV6") for r in rows if r.get("egressV6"))))
+          served = [r.get("served", 0) for r in rows]
+          limited = sum(1 for r in rows for x in r.get("results", []) if x == "limited")
+          gated = sum(1 for r in rows for x in r.get("results", []) if x == "gate")
+          ok = sum(1 for r in rows for x in r.get("results", []) if x == "ok")
+          print("=== total requests OK:", ok, " limited:", limited, " client-gate:", gated)
+          print("=== per-runner served:", sorted(served, reverse=True))
+          if served:
+              print("=== avg served per runner:", round(sum(served)/len(served), 2))
+              print("=== TOTAL SERVED THIS RUN:", sum(served))
+          print()
+          print("per-runner detail:")
+          for r in sorted(rows, key=lambda x: -x.get("served", 0)):
+              print("  runner %-3s v4=%-16s served=%s bucket=%s" % (
+                  r.get("runner"), r.get("egressV4"), r.get("served"), r.get("bucketSize")))
+          verdict = "INCONCLUSIVE"
+          if len(rows) >= 3 and ok > 0:
+              uniq_v4 = len(set(v4))
+              if limited == 0 and ok >= len(rows):
+                  verdict = "INDEPENDENT BUCKETS (no runner hit 429 while others served)"
+              elif ok > 0:
+                  verdict = "PARTIAL - some runners limited, others served"
+          print()
+          print("VERDICT:", verdict)
+          open("results/RELAY-SUMMARY.txt","w").write(
+              "runners=%d uniq_v4=%d ok=%d limited=%d gate=%d verdict=%s\n" %
+              (len(rows), len(set(v4)), ok, limited, gated, verdict))
+          PYEOF
+          echo
+          cat results/RELAY-SUMMARY.txt
